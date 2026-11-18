@@ -478,6 +478,20 @@ async fn test_large_plain_note_cursor_round_trip() {
     }
     assert!(pages > 1);
     assert_eq!(reconstructed, content);
+    let replace = Request::builder().method("PUT").uri(format!("/api/notes/{note_id}/chunks"))
+        .header(header::AUTHORIZATION, token).header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({"chunks": [
+            {"content": "a".repeat(200_000)},
+            {"content": "b".repeat(200_000)}
+        ]}).to_string())).unwrap();
+    assert_eq!(app.clone().oneshot(replace).await.unwrap().status(), StatusCode::OK);
+    let page = Request::builder().uri(format!("/api/notes/{note_id}/chunks?limit=8&lightweight=true"))
+        .header(header::AUTHORIZATION, token).body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(page).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["chunks"].as_array().unwrap().len(), 1);
+    assert_eq!(page["has_more"], true);
     let delete = Request::builder().method("DELETE").uri(format!("/api/notes/{note_id}"))
         .header(header::AUTHORIZATION, token).body(Body::empty()).unwrap();
     assert_eq!(app.oneshot(delete).await.unwrap().status(), StatusCode::OK);

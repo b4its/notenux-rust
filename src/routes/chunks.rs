@@ -15,6 +15,25 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 
+// Limit normal pages by bytes as well as by chunk count. A single legacy chunk
+// may exceed this budget and must still be returned intact.
+const PAGE_BYTE_BUDGET: u64 = 256 * 1024;
+
+fn chunk_page_query(note_id: u64, query: &ChunksQuery, select: &str, limit: u32) -> sqlx::QueryBuilder<'static, sqlx::MySql> {
+    let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(select.to_owned());
+    builder.push_bind(note_id);
+    if let (Some(index), Some(id)) = (query.after_index, query.after_id) {
+        builder.push(" AND (chunk_index > ").push_bind(index)
+            .push(" OR (chunk_index = ").push_bind(index)
+            .push(" AND id > ").push_bind(id).push("))");
+    }
+    builder.push(" ORDER BY chunk_index ASC, id ASC LIMIT ").push_bind(limit);
+    if query.after_id.is_none() && query.offset.unwrap_or(0) > 0 {
+        builder.push(" OFFSET ").push_bind(query.offset.unwrap_or(0));
+    }
+    builder
+}
+
 pub async fn get_chunks(
     State(state): State<AppState>,
     user: AuthUser,
@@ -43,23 +62,27 @@ pub async fn get_chunks(
         if query.after_id.is_some() && offset != 0 {
             return Err(ApiError(StatusCode::BAD_REQUEST, "Cursor cannot be combined with offset".into()));
         }
-        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
-            "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = "
-        );
-        builder.push_bind(note_id);
-        if let (Some(index), Some(id)) = (query.after_index, query.after_id) {
-            builder.push(" AND (chunk_index > ").push_bind(index)
-                .push(" OR (chunk_index = ").push_bind(index)
-                .push(" AND id > ").push_bind(id).push("))");
+        // Fetch index metadata first: looking ahead must not download an
+        // arbitrarily large LONGTEXT chunk just to determine has_more.
+        let sizes = chunk_page_query(note_id, &query,
+            "SELECT chunk_index, id, byte_size FROM note_chunks WHERE note_id = ", limit + 1)
+            .build_query_as::<(u32, u64, u32)>()
+            .fetch_all(&state.pool).await
+            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunk metadata".into()))?;
+        let mut page_size = 0u32;
+        let mut total = 0u64;
+        for &(_, _, size) in sizes.iter().take(limit as usize) {
+            if page_size > 0 && total + u64::from(size) > PAGE_BYTE_BUDGET {
+                break;
+            }
+            total += u64::from(size);
+            page_size += 1;
         }
-        builder.push(" ORDER BY chunk_index ASC, id ASC LIMIT ").push_bind(limit + 1);
-        if query.after_id.is_none() && offset > 0 {
-            builder.push(" OFFSET ").push_bind(offset);
-        }
-        let mut chunks = builder.build_query_as::<NoteChunk>().fetch_all(&state.pool).await
+        let chunks = chunk_page_query(note_id, &query,
+            "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ", page_size)
+            .build_query_as::<NoteChunk>().fetch_all(&state.pool).await
             .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
-        let has_more = chunks.len() > limit as usize;
-        chunks.truncate(limit as usize);
+        let has_more = !chunks.is_empty() && sizes.len() > chunks.len();
         return Ok(Json(serde_json::json!({
             "status": "success", "note_id": note_id, "note_uuid": uuid,
             "offset": offset, "limit": limit, "has_more": has_more,

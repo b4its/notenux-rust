@@ -77,6 +77,7 @@ pub async fn create_app(config: &Config) -> Result<Router, Box<dyn std::error::E
         )
         .route("/api/notes/{id}/pin", post(toggle_pin))
         .route("/api/notes/{id}/favorite", post(toggle_favorite))
+        .route("/api/notes/{id}/duplicate", post(duplicate_note))
         .route("/api/notes/{id}/chunks", get(get_chunks))
         .route("/api/notes/{id}/chunks/verify", get(verify_chunks))
         .route("/api/notes/{id}/chunks/reorder", post(reorder_chunks))

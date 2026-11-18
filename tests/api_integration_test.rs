@@ -119,7 +119,53 @@ async fn test_crud_and_progressive_chunk_loading_with_sanctum_token() {
     assert_eq!(verify_json["data"]["status"], "verified");
     assert_eq!(verify_json["data"]["verified"], true);
 
-    // 4. Clean up: Delete note
+    // 4. Search notes by chunk content directly in MySQL
+    let search_req = Request::builder()
+        .uri("/api/notes?q=mempesona")
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+
+    let search_resp = app.clone().oneshot(search_req).await.unwrap();
+    assert_eq!(search_resp.status(), StatusCode::OK);
+    let bytes = search_resp.into_body().collect().await.unwrap().to_bytes();
+    let search_json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(search_json["status"], "success");
+    let search_items = search_json["data"].as_array().unwrap();
+    assert!(search_items.iter().any(|item| item["id"] == note_id));
+
+    // 5. Duplicate note with chunks
+    let dup_req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/notes/{}/duplicate", note_id))
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+
+    let dup_resp = app.clone().oneshot(dup_req).await.unwrap();
+    assert_eq!(dup_resp.status(), StatusCode::CREATED);
+    let bytes = dup_resp.into_body().collect().await.unwrap().to_bytes();
+    let dup_json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(dup_json["status"], "success");
+    let cloned_id = dup_json["data"]["id"].as_u64().unwrap();
+    assert_ne!(cloned_id, note_id);
+    assert_eq!(dup_json["data"]["title"], "Scroll of Eternity (Copy)");
+    let cloned_chunks = dup_json["data"]["chunks"].as_array().unwrap();
+    assert_eq!(
+        cloned_chunks.len(),
+        created_json["data"]["chunks"].as_array().unwrap().len()
+    );
+
+    // 6. Clean up: Delete cloned note and original note
+    let delete_cloned_req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/notes/{}", cloned_id))
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let delete_cloned_resp = app.clone().oneshot(delete_cloned_req).await.unwrap();
+    assert_eq!(delete_cloned_resp.status(), StatusCode::OK);
+
     let delete_req = Request::builder()
         .method("DELETE")
         .uri(format!("/api/notes/{}", note_id))

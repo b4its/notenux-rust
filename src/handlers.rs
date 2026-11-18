@@ -120,8 +120,10 @@ pub async fn list_notes(
             .push(" AND (n.title LIKE ")
             .push_bind(pattern.clone())
             .push(" OR n.content LIKE ")
+            .push_bind(pattern.clone())
+            .push(" OR EXISTS (SELECT 1 FROM note_chunks c WHERE c.note_id = n.id AND c.content LIKE ")
             .push_bind(pattern)
-            .push(")");
+            .push("))");
     }
 
     // Sorting
@@ -839,6 +841,163 @@ pub async fn toggle_favorite(
         "is_favorite": updated_fav.0,
         "message": if updated_fav.0 { "Scroll favorited!" } else { "Scroll unfavorited!" }
     })))
+}
+
+pub async fn duplicate_note(
+    State(state): State<AppState>,
+    parts: Parts,
+    Path(note_id): Path<u64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = authenticate(&parts, &state.pool, &state.cache)
+        .await
+        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
+
+    // 1. Fetch source note
+    let source_note = sqlx::query_as::<_, Note>(
+        "SELECT id, user_id, folder_id, uuid, title, category, content, font_family, font_size, theme_color, word_count, char_count, is_pinned, is_favorite, level, xp, created_at, updated_at FROM notes WHERE id = ? AND user_id = ?"
+    )
+    .bind(note_id)
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
+    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
+
+    // 2. Fetch source chunks
+    let source_chunks = sqlx::query_as::<_, NoteChunk>(
+        "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
+    )
+    .bind(note_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
+
+    let mut tx = state.pool.begin().await.map_err(|_| {
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Transaction error".into())
+    })?;
+
+    let new_uuid = uuid::Uuid::new_v4().to_string();
+    let mut new_title = source_note.title.clone();
+    if new_title.chars().count() > 240 {
+        new_title = new_title.chars().take(240).collect();
+    }
+    new_title.push_str(" (Copy)");
+
+    let insert_res = sqlx::query(
+        r#"
+        INSERT INTO notes 
+            (user_id, folder_id, uuid, title, category, content, font_family, font_size, theme_color, word_count, char_count, is_pinned, is_favorite, level, xp, created_at, updated_at)
+        VALUES 
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NOW(), NOW())
+        "#,
+    )
+    .bind(user.id)
+    .bind(source_note.folder_id)
+    .bind(&new_uuid)
+    .bind(&new_title)
+    .bind(&source_note.category)
+    .bind(&source_note.content)
+    .bind(&source_note.font_family)
+    .bind(&source_note.font_size)
+    .bind(&source_note.theme_color)
+    .bind(source_note.word_count)
+    .bind(source_note.char_count)
+    .bind(source_note.is_favorite)
+    .bind(source_note.level)
+    .bind(source_note.xp)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to duplicate note: {:?}", e);
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to duplicate note".into())
+    })?;
+
+    let new_note_id = insert_res.last_insert_id();
+
+    let mut cloned_chunks = Vec::new();
+    for ch in source_chunks {
+        let new_chunk_uid = crate::chunker::generate_chunk_uid();
+        let meta_json = ch.metadata.as_ref().map(|m| m.to_string());
+        let chunk_res = sqlx::query(
+            r#"
+            INSERT INTO note_chunks 
+                (note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at)
+            VALUES 
+                (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+            "#,
+        )
+        .bind(new_note_id)
+        .bind(&new_chunk_uid)
+        .bind(ch.chunk_index)
+        .bind(&ch.chunk_type)
+        .bind(&ch.content)
+        .bind(ch.byte_size)
+        .bind(&ch.checksum)
+        .bind(meta_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to duplicate chunk: {:?}", e);
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to duplicate chunks".into())
+        })?;
+
+        cloned_chunks.push(NoteChunk {
+            id: chunk_res.last_insert_id(),
+            note_id: new_note_id,
+            chunk_uid: new_chunk_uid,
+            chunk_index: ch.chunk_index,
+            chunk_type: ch.chunk_type,
+            content: ch.content,
+            byte_size: ch.byte_size,
+            checksum: ch.checksum,
+            metadata: ch.metadata,
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
+        });
+    }
+
+    tx.commit().await.map_err(|_| {
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
+    })?;
+
+    let cloned_note = Note {
+        id: new_note_id,
+        user_id: user.id,
+        folder_id: source_note.folder_id,
+        uuid: new_uuid,
+        title: new_title,
+        category: source_note.category,
+        content: source_note.content,
+        font_family: source_note.font_family,
+        font_size: source_note.font_size,
+        theme_color: source_note.theme_color,
+        word_count: source_note.word_count,
+        char_count: source_note.char_count,
+        is_pinned: false,
+        is_favorite: source_note.is_favorite,
+        level: source_note.level,
+        xp: source_note.xp,
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
+    };
+
+    state
+        .cache
+        .insert_note(user.id, cloned_note.clone(), cloned_chunks.clone())
+        .await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "status": "success",
+            "message": "Scroll duplicated into the memory matrix!",
+            "data": NoteWithChunks {
+                reading_time: cloned_note.reading_time(),
+                note: cloned_note,
+                chunks: cloned_chunks,
+            }
+        })),
+    ))
 }
 
 pub async fn update_chunk(

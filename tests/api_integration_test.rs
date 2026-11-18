@@ -246,6 +246,23 @@ async fn test_full_specification_workflow() {
     assert_eq!(later["chunks"][0]["chunk_index"], 2);
     assert_eq!(later["total_bytes"], chunks_json["total_bytes"]);
 
+    let cursor_id = returned_chunks[1]["id"].as_u64().unwrap();
+    let cursor_req = Request::builder()
+        .uri(format!("/api/notes/{note_id}/chunks?offset=0&limit=1&lightweight=true&after_index=1&after_id={cursor_id}"))
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .body(Body::empty()).unwrap();
+    let cursor_response = app.clone().oneshot(cursor_req).await.unwrap();
+    assert_eq!(cursor_response.status(), StatusCode::OK);
+    let cursor_json: Value = serde_json::from_slice(&cursor_response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(cursor_json["chunks"][0]["chunk_index"], 2);
+    assert_eq!(cursor_json["has_more"], true);
+    assert!(cursor_json.get("total_chunks").is_none());
+    let malformed_cursor = Request::builder()
+        .uri(format!("/api/notes/{note_id}/chunks?lightweight=true&after_index=1"))
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(malformed_cursor).await.unwrap().status(), StatusCode::BAD_REQUEST);
+
     // 4. Repeated chunk query hits initial chunks Moka cache
     let cache_hit_req = Request::builder()
         .uri(format!("/api/notes/{}/chunks?offset=0&limit=2", note_id))

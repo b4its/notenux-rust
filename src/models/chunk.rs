@@ -21,6 +21,9 @@ pub struct NoteChunk {
 pub struct ChunksQuery {
     pub offset: Option<u32>,
     pub limit: Option<u32>,
+    pub after_index: Option<u32>,
+    pub after_id: Option<u64>,
+    pub lightweight: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

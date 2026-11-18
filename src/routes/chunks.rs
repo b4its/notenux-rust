@@ -35,6 +35,39 @@ pub async fn get_chunks(
             "limit must be between 1 and 100".into(),
         ));
     }
+    if query.lightweight.unwrap_or(false) {
+        if query.after_index.is_some() != query.after_id.is_some() {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "Both cursor fields are required".into()));
+        }
+        if query.after_id.is_some() && offset != 0 {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "Cursor cannot be combined with offset".into()));
+        }
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = "
+        );
+        builder.push_bind(note_id);
+        if let (Some(index), Some(id)) = (query.after_index, query.after_id) {
+            builder.push(" AND (chunk_index > ").push_bind(index)
+                .push(" OR (chunk_index = ").push_bind(index)
+                .push(" AND id > ").push_bind(id).push("))");
+        }
+        builder.push(" ORDER BY chunk_index ASC, id ASC LIMIT ").push_bind(limit + 1);
+        if query.after_id.is_none() && offset > 0 {
+            builder.push(" OFFSET ").push_bind(offset);
+        }
+        let mut chunks = builder.build_query_as::<NoteChunk>().fetch_all(&state.pool).await
+            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
+        let has_more = chunks.len() > limit as usize;
+        chunks.truncate(limit as usize);
+        return Ok(Json(serde_json::json!({
+            "status": "success", "note_id": note_id, "note_uuid": uuid,
+            "offset": offset, "limit": limit, "has_more": has_more,
+            "chunks": chunks,
+        })));
+    }
+    if query.after_index.is_some() || query.after_id.is_some() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "Cursor requires lightweight mode".into()));
+    }
     let (total_chunks, total_bytes): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), CAST(COALESCE(SUM(byte_size), 0) AS SIGNED) FROM note_chunks WHERE note_id = ?"
     ).bind(note_id).fetch_one(&state.pool).await

@@ -96,8 +96,7 @@ pub fn generate_chunk_uid() -> String {
 }
 
 pub fn split_into_chunks(content: &str) -> Vec<ChunkDraft> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
+    if content.is_empty() {
         let checksum = compute_checksum("");
         return vec![ChunkDraft {
             chunk_uid: generate_chunk_uid(),
@@ -193,31 +192,16 @@ fn split_html_blocks(content: &str) -> Vec<String> {
 
 fn split_plain_text_blocks(content: &str) -> Vec<String> {
     let mut raw_blocks = Vec::new();
-    let mut current_accumulator = String::new();
-
-    for paragraph in content.split("\n\n") {
-        if !current_accumulator.is_empty()
-            && (current_accumulator.len() + paragraph.len() + 2 > MAX_CHUNK_SIZE)
-        {
-            raw_blocks.push(std::mem::take(&mut current_accumulator));
-            current_accumulator = paragraph.to_string();
-        } else if current_accumulator.is_empty() {
-            current_accumulator = paragraph.to_string();
-        } else {
-            current_accumulator.push_str("\n\n");
-            current_accumulator.push_str(paragraph);
+    let mut start = 0;
+    while start < content.len() {
+        let mut end = (start + MAX_CHUNK_SIZE).min(content.len());
+        while !content.is_char_boundary(end) {
+            end -= 1;
         }
+        raw_blocks.push(content[start..end].to_string());
+        start = end;
     }
-
-    if !current_accumulator.is_empty() {
-        raw_blocks.push(current_accumulator);
-    }
-
-    if raw_blocks.is_empty() {
-        vec![content.to_string()]
-    } else {
-        raw_blocks
-    }
+    raw_blocks
 }
 
 pub fn calculate_metrics(content: &str) -> NoteMetrics {
@@ -282,5 +266,15 @@ mod tests {
         assert!(metrics.char_count > 0);
         assert_eq!(metrics.xp, 10);
         assert_eq!(metrics.level, 1);
+    }
+
+    #[test]
+    fn large_plain_text_round_trips_without_losing_separators_or_unicode() {
+        let content = format!("{}\n\n{}  ", "a".repeat(995), "🦀".repeat(2000));
+        let chunks = split_into_chunks(&content);
+        assert!(chunks.len() > 2);
+        assert!(chunks.iter().all(|chunk| chunk.content.len() <= MAX_CHUNK_SIZE));
+        assert_eq!(chunks.iter().map(|chunk| chunk.content.as_str()).collect::<String>(), content);
+        assert_eq!(split_into_chunks("  \n")[0].content, "  \n");
     }
 }

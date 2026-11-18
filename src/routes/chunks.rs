@@ -20,7 +20,6 @@ pub async fn get_chunks(
     Path(note_id): Path<u64>,
     Query(query): Query<ChunksQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // 1. Verify note ownership
     let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM notes WHERE id = ? AND user_id = ?")
         .bind(note_id)
         .bind(user.id)
@@ -28,101 +27,66 @@ pub async fn get_chunks(
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
-
-    let offset = query.offset.unwrap_or(0) as usize;
-
-    // Fast-path for initial chunks (offset = 0 and limit <= 2)
-    if offset == 0 && query.limit.is_some_and(|l| l <= 2) {
-        if let Some(initials) = state.cache.get_initial_chunks(user.id, note_id).await {
-            let limit = query.limit.unwrap() as usize;
-            let end = limit.min(initials.len());
-            let sliced = initials[0..end].to_vec();
-            let total_chunks: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM note_chunks WHERE note_id = ?")
-                .bind(note_id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap_or((initials.len() as i64,));
-
-            let total_c = total_chunks.0 as usize;
-            let total_bytes: u32 = initials.iter().map(|c| c.byte_size).sum();
-
-            return Ok(Json(serde_json::json!({
-                "status": "success",
-                "note_id": note_id,
-                "note_uuid": uuid,
-                "total_chunks": total_c,
-                "total_bytes": total_bytes,
-                "offset": 0,
-                "limit": limit,
-                "has_more": limit < total_c,
-                "chunks": sliced,
-            })));
-        }
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(2);
+    if limit == 0 || limit > 100 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 100".into(),
+        ));
     }
-
-    // Check full chunks cache
-    let all_chunks = if let Some(cached) = state.cache.get_note(user.id, note_id).await {
-        cached.chunks.clone()
+    let (total_chunks, total_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), CAST(COALESCE(SUM(byte_size), 0) AS SIGNED) FROM note_chunks WHERE note_id = ?"
+    ).bind(note_id).fetch_one(&state.pool).await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?;
+    let cached = if offset == 0 && limit == 2 {
+        state
+            .cache
+            .get_initial_chunks(user.id, note_id)
+            .await
+            .map(|p| (*p).clone())
     } else {
-        // Query from MySQL
-        let db_chunks = sqlx::query_as::<_, NoteChunk>(
-            "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
-        )
-        .bind(note_id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
-
-        // Cache initial chunks (0 and 1) for prioritized access
-        let initials: Vec<NoteChunk> = db_chunks
-            .iter()
-            .filter(|c| c.chunk_index <= 1)
-            .cloned()
-            .collect();
-        if !initials.is_empty() {
-            state
-                .cache
-                .insert_initial_chunks(user.id, note_id, initials)
-                .await;
-        }
-
-        db_chunks
+        state
+            .cache
+            .get_page(user.id, note_id, offset, limit)
+            .await
+            .map(|p| p.chunks.clone())
     };
-
-    let total_chunks = all_chunks.len();
-    let total_bytes: u32 = all_chunks.iter().map(|c| c.byte_size).sum();
-
-    // Sliced chunk response if limit is specified
-    if let Some(limit) = query.limit {
-        let limit = limit as usize;
-        let end = (offset + limit).min(total_chunks);
-        let sliced = if offset < total_chunks {
-            all_chunks[offset..end].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        return Ok(Json(serde_json::json!({
-            "status": "success",
-            "note_id": note_id,
-            "note_uuid": uuid,
-            "total_chunks": total_chunks,
-            "total_bytes": total_bytes,
-            "offset": offset,
-            "limit": limit,
-            "has_more": end < total_chunks,
-            "chunks": sliced,
-        })));
-    }
-
-    // Default: full list of chunks
+    let chunks = match cached {
+        Some(chunks) => chunks,
+        None => {
+            let chunks = sqlx::query_as::<_, NoteChunk>(
+                "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC, id ASC LIMIT ? OFFSET ?"
+            ).bind(note_id).bind(limit).bind(offset).fetch_all(&state.pool).await
+                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
+            if offset == 0 && limit == 2 {
+                state
+                    .cache
+                    .insert_initial_chunks(user.id, note_id, chunks.clone())
+                    .await;
+            } else {
+                state
+                    .cache
+                    .insert_page(
+                        user.id,
+                        note_id,
+                        crate::cache::CachedPage {
+                            offset,
+                            limit,
+                            chunks: chunks.clone(),
+                        },
+                    )
+                    .await;
+            }
+            chunks
+        }
+    };
     Ok(Json(serde_json::json!({
-        "status": "success",
-        "note_id": note_id,
-        "note_uuid": uuid,
-        "total_chunks": total_chunks,
-        "total_bytes": total_bytes,
-        "chunks": all_chunks,
+        "status": "success", "note_id": note_id, "note_uuid": uuid,
+        "total_chunks": total_chunks, "total_bytes": total_bytes,
+        "offset": offset, "limit": limit,
+        "has_more": u64::from(offset) + (chunks.len() as u64) < total_chunks as u64,
+        "chunks": chunks,
     })))
 }
 
@@ -143,7 +107,10 @@ pub async fn update_chunks(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
 
     let mut tx = state.pool.begin().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Transaction error".into())
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Transaction error".into(),
+        )
     })?;
 
     // Case A: Provided content string to re-chunk
@@ -152,7 +119,12 @@ pub async fn update_chunks(
             .bind(note_id)
             .execute(&mut *tx)
             .await
-            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to clear chunks".into()))?;
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to clear chunks".into(),
+                )
+            })?;
 
         let drafts = split_into_chunks(&content);
         let mut new_chunks = Vec::new();
@@ -207,9 +179,9 @@ pub async fn update_chunks(
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Note update failed".into()))?;
 
-        tx.commit().await.map_err(|_| {
-            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
-        })?;
+        tx.commit()
+            .await
+            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into()))?;
 
         // Invalidate cache
         state.cache.invalidate_note(user.id, note_id).await;
@@ -219,23 +191,44 @@ pub async fn update_chunks(
             "message": "Chunks successfully re-created and cached!",
             "note_id": note_id,
             "chunks": new_chunks
-        })).into_response());
+        }))
+        .into_response());
     }
 
     // Case B: Provided explicit chunk array
-    if let Some(chunks) = payload.chunks {
+    if let Some(mut chunks) = payload.chunks {
+        for (index, chunk) in chunks.iter_mut().enumerate() {
+            chunk.chunk_index.get_or_insert(index as u32);
+        }
+        chunks.sort_by_key(|chunk| chunk.chunk_index);
+        if chunks
+            .windows(2)
+            .any(|pair| pair[0].chunk_index == pair[1].chunk_index)
+        {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "Duplicate chunk index".into(),
+            ));
+        }
         sqlx::query("DELETE FROM note_chunks WHERE note_id = ?")
             .bind(note_id)
             .execute(&mut *tx)
             .await
-            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to clear chunks".into()))?;
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to clear chunks".into(),
+                )
+            })?;
 
         let mut inserted_chunks = Vec::new();
         let mut reassembled_text = String::new();
 
         for (idx, ch) in chunks.into_iter().enumerate() {
             let chunk_index = ch.chunk_index.unwrap_or(idx as u32);
-            let chunk_type = ch.chunk_type.unwrap_or_else(|| detect_chunk_type(&ch.content));
+            let chunk_type = ch
+                .chunk_type
+                .unwrap_or_else(|| detect_chunk_type(&ch.content));
             let byte_size = ch.content.len() as u32;
             let checksum = compute_checksum(&ch.content);
             let chunk_uid = crate::chunker::generate_chunk_uid();
@@ -290,9 +283,9 @@ pub async fn update_chunks(
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Note update failed".into()))?;
 
-        tx.commit().await.map_err(|_| {
-            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
-        })?;
+        tx.commit()
+            .await
+            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into()))?;
 
         state.cache.invalidate_note(user.id, note_id).await;
 
@@ -301,17 +294,8 @@ pub async fn update_chunks(
             "message": "Chunks successfully replaced!",
             "note_id": note_id,
             "chunks": inserted_chunks
-        })).into_response());
-    }
-
-    // Case C: Provided single chunk_id with content
-    if let (Some(cid), Some(ctype)) = (payload.chunk_id, payload.chunk_type) {
-        let dummy_payload = UpdateChunkPayload {
-            content: ctype,
-            chunk_type: None,
-        };
-        let res = update_single_chunk(State(state), user, Path((note_id, cid)), Json(dummy_payload)).await?;
-        return Ok(res.into_response());
+        }))
+        .into_response());
     }
 
     Err(ApiError(
@@ -342,7 +326,10 @@ pub async fn update_single_chunk(
     let checksum = compute_checksum(&payload.content);
 
     let mut tx = state.pool.begin().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Transaction error".into())
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Transaction error".into(),
+        )
     })?;
 
     let update_res = sqlx::query(
@@ -360,7 +347,12 @@ pub async fn update_single_chunk(
     .bind(note_id)
     .execute(&mut *tx)
     .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Chunk update failed".into()))?;
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Chunk update failed".into(),
+        )
+    })?;
 
     if update_res.rows_affected() == 0 {
         return Err(ApiError(StatusCode::NOT_FOUND, "Chunk not found".into()));
@@ -398,11 +390,16 @@ pub async fn update_single_chunk(
     .bind(note_id)
     .execute(&mut *tx)
     .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Note update failed".into()))?;
-
-    tx.commit().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Note update failed".into(),
+        )
     })?;
+
+    tx.commit()
+        .await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into()))?;
 
     // Invalidate Moka cache
     state.cache.invalidate_note(user.id, note_id).await;
@@ -416,7 +413,8 @@ pub async fn update_single_chunk(
             "chunk": updated_chunk,
             "note_id": note_id,
         }
-    })).into_response())
+    }))
+    .into_response())
 }
 
 pub async fn delete_chunk(
@@ -433,7 +431,10 @@ pub async fn delete_chunk(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
 
     let mut tx = state.pool.begin().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Transaction error".into())
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Transaction error".into(),
+        )
     })?;
 
     let del_res = sqlx::query("DELETE FROM note_chunks WHERE id = ? AND note_id = ?")
@@ -463,7 +464,9 @@ pub async fn delete_chunk(
                 .bind(ch.id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Reindex failed".into()))?;
+                .map_err(|_| {
+                    ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Reindex failed".into())
+                })?;
         }
     }
 
@@ -490,11 +493,16 @@ pub async fn delete_chunk(
     .bind(note_id)
     .execute(&mut *tx)
     .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Note update failed".into()))?;
-
-    tx.commit().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Note update failed".into(),
+        )
     })?;
+
+    tx.commit()
+        .await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into()))?;
 
     // Invalidate cache
     state.cache.invalidate_note(user.id, note_id).await;
@@ -520,7 +528,10 @@ pub async fn reorder_chunks(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
 
     let mut tx = state.pool.begin().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Transaction error".into())
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Transaction error".into(),
+        )
     })?;
 
     for (new_index, chunk_id) in payload.order.iter().enumerate() {
@@ -564,11 +575,16 @@ pub async fn reorder_chunks(
     .bind(note_id)
     .execute(&mut *tx)
     .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Note update failed".into()))?;
-
-    tx.commit().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Note update failed".into(),
+        )
     })?;
+
+    tx.commit()
+        .await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into()))?;
 
     state.cache.invalidate_note(user.id, note_id).await;
 

@@ -48,6 +48,27 @@ async fn test_unauthenticated_request_rejected() {
 }
 
 #[tokio::test]
+async fn test_dev_header_and_malformed_tokens_cannot_bypass_authentication() {
+    let app = create_app(&Config::from_env())
+        .await
+        .expect("Failed to create app");
+    for token in [None, Some("Bearer not-a-sanctum-token"), Some("Bearer 1|")] {
+        let mut request = Request::builder()
+            .uri("/api/notes")
+            .header("x-dev-user-id", "1");
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, token);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
 async fn test_invalid_sanctum_token_rejected() {
     let config = Config::from_env();
     let app = create_app(&config).await.expect("Failed to create app");
@@ -77,13 +98,19 @@ async fn test_cors_preflight_and_headers() {
         .uri("/api/notes")
         .header(header::ORIGIN, "http://localhost:5173")
         .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
-        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization,content-type")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "authorization,content-type",
+        )
         .body(Body::empty())
         .unwrap();
 
     let response = app.clone().oneshot(options_req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let allow_origin = response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap();
+    let allow_origin = response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .unwrap();
     assert_eq!(allow_origin.to_str().unwrap(), "http://localhost:5173");
 
     // Test allowed origin https://app.notenux.oryphem.com
@@ -97,8 +124,14 @@ async fn test_cors_preflight_and_headers() {
 
     let prod_response = app.oneshot(options_prod_req).await.unwrap();
     assert_eq!(prod_response.status(), StatusCode::OK);
-    let prod_allow_origin = prod_response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap();
-    assert_eq!(prod_allow_origin.to_str().unwrap(), "https://app.notenux.oryphem.com");
+    let prod_allow_origin = prod_response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .unwrap();
+    assert_eq!(
+        prod_allow_origin.to_str().unwrap(),
+        "https://app.notenux.oryphem.com"
+    );
 }
 
 #[tokio::test]
@@ -110,10 +143,22 @@ async fn test_full_specification_workflow() {
     let token = "1|sanctum_test_token_1234567890abcdef";
 
     // 1. POST /api/notes: Create note with multi-chunk content
-    let block0 = format!("<p>Chunk 0: Pembukaan misteri gulungan naga emas. {}</p>", "A".repeat(1100));
-    let block1 = format!("<p>Chunk 1: Penjelasan mantra kuno elemen petir. {}</p>", "B".repeat(1100));
-    let block2 = format!("<p>Chunk 2: Ritual rahasia para petapa gunung suci. {}</p>", "C".repeat(1100));
-    let block3 = format!("<p>Chunk 3: Bab penutup prasasti kekekalan abadi. {}</p>", "D".repeat(1100));
+    let block0 = format!(
+        "<p>Chunk 0: Pembukaan misteri gulungan naga emas. {}</p>",
+        "A".repeat(1100)
+    );
+    let block1 = format!(
+        "<p>Chunk 1: Penjelasan mantra kuno elemen petir. {}</p>",
+        "B".repeat(1100)
+    );
+    let block2 = format!(
+        "<p>Chunk 2: Ritual rahasia para petapa gunung suci. {}</p>",
+        "C".repeat(1100)
+    );
+    let block3 = format!(
+        "<p>Chunk 3: Bab penutup prasasti kekekalan abadi. {}</p>",
+        "D".repeat(1100)
+    );
     let multi_chunk_content = format!("{}\n{}\n{}\n{}", block0, block1, block2, block3);
 
     let create_payload = serde_json::json!({
@@ -187,6 +232,20 @@ async fn test_full_specification_workflow() {
     assert_eq!(returned_chunks[1]["chunk_index"], 1);
     assert_eq!(chunks_json["has_more"], true);
 
+    let later_req = Request::builder()
+        .uri(format!("/api/notes/{}/chunks?offset=2&limit=1", note_id))
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let later_resp = app.clone().oneshot(later_req).await.unwrap();
+    assert_eq!(later_resp.status(), StatusCode::OK);
+    let later: Value =
+        serde_json::from_slice(&later_resp.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(later["chunks"].as_array().unwrap().len(), 1);
+    assert_eq!(later["chunks"][0]["chunk_index"], 2);
+    assert_eq!(later["total_bytes"], chunks_json["total_bytes"]);
+
     // 4. Repeated chunk query hits initial chunks Moka cache
     let cache_hit_req = Request::builder()
         .uri(format!("/api/notes/{}/chunks?offset=0&limit=2", note_id))
@@ -212,8 +271,14 @@ async fn test_full_specification_workflow() {
     assert!(search_results.iter().any(|item| item["id"] == note_id));
 
     // 6. PUT /api/notes/{note_id}/chunks: Update chunks and invalidate cache
-    let up0 = format!("<p>Chunk 0: Bab Baru Naga Berbisik. {}</p>", "X".repeat(1100));
-    let up1 = format!("<p>Chunk 1: Petir menyambar langit kelam. {}</p>", "Y".repeat(1100));
+    let up0 = format!(
+        "<p>Chunk 0: Bab Baru Naga Berbisik. {}</p>",
+        "X".repeat(1100)
+    );
+    let up1 = format!(
+        "<p>Chunk 1: Petir menyambar langit kelam. {}</p>",
+        "Y".repeat(1100)
+    );
     let updated_content = format!("{}\n{}", up0, up1);
 
     let update_chunks_payload = serde_json::json!({
@@ -239,11 +304,19 @@ async fn test_full_specification_workflow() {
         .unwrap();
     let verify_get_resp = app.clone().oneshot(verify_get_req).await.unwrap();
     assert_eq!(verify_get_resp.status(), StatusCode::OK);
-    let bytes = verify_get_resp.into_body().collect().await.unwrap().to_bytes();
+    let bytes = verify_get_resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let verify_json: Value = serde_json::from_slice(&bytes).unwrap();
     let new_chunks = verify_json["chunks"].as_array().unwrap();
     assert_eq!(new_chunks.len(), 2);
-    assert!(new_chunks[0]["content"].as_str().unwrap().contains("Naga Berbisik"));
+    assert!(new_chunks[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Naga Berbisik"));
 
     // 7. GET /api/notes/{note_id}/chunks/verify: Verify cryptographic integrity
     let verify_checksum_req = Request::builder()
@@ -253,7 +326,12 @@ async fn test_full_specification_workflow() {
         .unwrap();
     let verify_checksum_resp = app.clone().oneshot(verify_checksum_req).await.unwrap();
     assert_eq!(verify_checksum_resp.status(), StatusCode::OK);
-    let bytes = verify_checksum_resp.into_body().collect().await.unwrap().to_bytes();
+    let bytes = verify_checksum_resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let verify_checksum_json: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(verify_checksum_json["data"]["verified"], true);
 

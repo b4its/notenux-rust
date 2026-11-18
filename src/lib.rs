@@ -13,11 +13,7 @@ use axum::{
 use cache::AppCache;
 use config::Config;
 use sqlx::MySqlPool;
-use tower_http::{
-    compression::CompressionLayer,
-    cors::CorsLayer,
-    trace::TraceLayer,
-};
+use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -64,8 +60,6 @@ pub async fn create_app(config: &Config) -> Result<Router, Box<dyn std::error::E
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::ACCEPT,
-            header::COOKIE,
-            header::HeaderName::from_static("x-dev-user-id"),
             header::HeaderName::from_static("x-session-id"),
             header::HeaderName::from_static("x-csrf-token"),
             header::HeaderName::from_static("x-requested-with"),

@@ -1,6 +1,6 @@
 use crate::{
     cache::AppCache,
-    models::{AuthError, AuthUser, SessionRow, TokenRow},
+    models::{AuthError, AuthUser, TokenRow},
 };
 use axum::{
     extract::{FromRef, FromRequestParts},
@@ -10,12 +10,9 @@ use sha2::{Digest, Sha256};
 use sqlx::MySqlPool;
 
 pub fn hash_token(plain: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(plain.as_bytes());
-    hex::encode(hasher.finalize())
+    hex::encode(Sha256::digest(plain.as_bytes()))
 }
 
-/// Axum Extractor for AuthUser: enables handlers to simply declare `user: AuthUser`
 impl<S> FromRequestParts<S> for AuthUser
 where
     S: Send + Sync,
@@ -29,161 +26,46 @@ where
     }
 }
 
-/// Validates Laravel Sanctum token or session cookie.
-/// Caches successful token validations in Moka for 10 minutes to eliminate DB queries on chunk fetches.
 pub async fn authenticate(
     parts: &Parts,
     pool: &MySqlPool,
     cache: &AppCache,
 ) -> Result<AuthUser, AuthError> {
-    // 1. Check Authorization Bearer header: {id}|{plain_text_token}
-    if let Some(auth_val) = parts.headers.get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth_val.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ").map(|s| s.trim()) {
-                if !token.is_empty() {
-                    return validate_sanctum_token(token, pool, cache).await;
-                }
-            }
-        }
-    }
-
-    // 2. Fallback: Session Cookie (for web session compatibility)
-    if let Some(cookie_val) = parts.headers.get(header::COOKIE) {
-        if let Ok(cookie_str) = cookie_val.to_str() {
-            for pair in cookie_str.split(';') {
-                let trimmed = pair.trim();
-                if let Some((name, val)) = trimmed.split_once('=') {
-                    if name == "notenux-session" || name == "laravel_session" {
-                        if let Ok(user) = validate_session(val, pool, cache).await {
-                            return Ok(user);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Fallback: Developer Header (for testing environments)
-    if let Some(dev_user_header) = parts.headers.get("x-dev-user-id") {
-        if let Ok(s) = dev_user_header.to_str() {
-            if let Ok(uid) = s.parse::<u64>() {
-                return Ok(AuthUser { id: uid });
-            }
-        }
-    }
-
-    Err(AuthError::MissingCredentials)
-}
-
-/// Core Sanctum token validation:
-/// - Extracts {id} and {plain_text_token}
-/// - Computes SHA-256 hash
-/// - Queries MySQL personal_access_tokens
-/// - Caches valid user_id in Moka for 10 minutes
-async fn validate_sanctum_token(
-    raw_token: &str,
-    pool: &MySqlPool,
-    cache: &AppCache,
-) -> Result<AuthUser, AuthError> {
-    let (token_id_opt, secret) = if let Some((id_str, sec)) = raw_token.split_once('|') {
-        (id_str.parse::<u64>().ok(), sec)
-    } else {
-        (None, raw_token)
-    };
-
-    let hashed_secret = hash_token(secret);
-    let cache_key = match token_id_opt {
-        Some(tid) => format!("sanctum:{}:{}", tid, hashed_secret),
-        None => format!("sanctum:plain:{}", hashed_secret),
-    };
-
-    // Check 10-minute Moka cache first
-    if let Some(cached_user_id) = cache.get_cached_user(&cache_key).await {
-        return Ok(AuthUser { id: cached_user_id });
-    }
-
-    // Query personal_access_tokens from database
-    let row_res: Result<Option<TokenRow>, sqlx::Error> = if let Some(token_id) = token_id_opt {
-        sqlx::query_as::<_, TokenRow>(
-            "SELECT tokenable_id, token, expires_at FROM personal_access_tokens WHERE id = ?",
-        )
-        .bind(token_id)
-        .fetch_optional(pool)
-        .await
-    } else {
-        sqlx::query_as::<_, TokenRow>(
-            "SELECT tokenable_id, token, expires_at FROM personal_access_tokens WHERE token = ?",
-        )
-        .bind(&hashed_secret)
-        .fetch_optional(pool)
-        .await
-    };
-
-    let row = match row_res {
-        Ok(Some(r)) => r,
-        Ok(None) => return Err(AuthError::InvalidToken),
-        Err(e) => {
-            tracing::error!("DB error verifying Sanctum token: {:?}", e);
-            return Err(AuthError::DatabaseError);
-        }
-    };
-
-    // Verify token hash
-    if row.token != hashed_secret {
+    let raw = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(AuthError::MissingCredentials)?;
+    let (id, secret) = raw.split_once('|').ok_or(AuthError::InvalidToken)?;
+    let id = id
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or(AuthError::InvalidToken)?;
+    if secret.is_empty() || secret.contains('|') {
         return Err(AuthError::InvalidToken);
     }
-
-    // Check expiration timestamp
-    if let Some(expires_at) = row.expires_at {
-        if expires_at <= chrono::Utc::now() {
-            return Err(AuthError::InvalidToken);
-        }
+    let hash = hash_token(secret);
+    let key = format!("{id}:{hash}");
+    if let Some(user) = cache.get_cached_user(&key).await {
+        return Ok(AuthUser { id: user });
     }
-
-    let user_id = row.tokenable_id;
-
-    // Cache valid user in Moka (10 minute TTL)
-    cache.cache_user(cache_key, user_id).await;
-
-    Ok(AuthUser { id: user_id })
-}
-
-/// Fallback session validator
-async fn validate_session(
-    session_id: &str,
-    pool: &MySqlPool,
-    cache: &AppCache,
-) -> Result<AuthUser, AuthError> {
-    let cache_key = format!("session:{}", session_id);
-    if let Some(cached_uid) = cache.get_cached_user(&cache_key).await {
-        return Ok(AuthUser { id: cached_uid });
+    let row = sqlx::query_as::<_, TokenRow>(
+        "SELECT tokenable_id, token, expires_at FROM personal_access_tokens WHERE id = ? AND token = ? AND tokenable_type = ?"
+    ).bind(id).bind(&hash).bind("App\\Models\\User").fetch_optional(pool).await.map_err(|e| {
+        tracing::error!("DB error verifying Sanctum token: {e}"); AuthError::DatabaseError
+    })?.ok_or(AuthError::InvalidToken)?;
+    if row
+        .expires_at
+        .is_some_and(|expiry| expiry <= chrono::Utc::now())
+    {
+        return Err(AuthError::InvalidToken);
     }
-
-    let now_ts = chrono::Utc::now().timestamp() as i32;
-    // Session valid if last activity within 7 days
-    let min_activity = now_ts - 604800;
-
-    let row_res = sqlx::query_as::<_, SessionRow>(
-        "SELECT user_id FROM sessions WHERE id = ? AND last_activity > ?",
-    )
-    .bind(session_id)
-    .bind(min_activity)
-    .fetch_optional(pool)
-    .await;
-
-    match row_res {
-        Ok(Some(r)) => {
-            if let Some(uid) = r.user_id {
-                cache.cache_user(cache_key, uid).await;
-                Ok(AuthUser { id: uid })
-            } else {
-                Err(AuthError::InvalidToken)
-            }
-        }
-        Ok(None) => Err(AuthError::InvalidToken),
-        Err(e) => {
-            tracing::error!("DB error checking session: {:?}", e);
-            Err(AuthError::DatabaseError)
-        }
-    }
+    cache
+        .cache_user(key, row.tokenable_id, row.expires_at)
+        .await;
+    Ok(AuthUser {
+        id: row.tokenable_id,
+    })
 }

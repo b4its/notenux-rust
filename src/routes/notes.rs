@@ -1,82 +1,41 @@
 use crate::{
-    auth::authenticate,
-    cache::AppCache,
-    chunker::{calculate_metrics, compute_checksum, detect_chunk_type, split_into_chunks},
+    chunker::{calculate_metrics, generate_chunk_uid, split_into_chunks},
     models::{
-        ChunksQuery, CreateNotePayload, Note, NoteChunk, NoteSummary, NoteWithChunks,
-        NotesListQuery, ReorderChunksPayload, UpdateChunkPayload, UpdateNotePayload,
+        AuthUser, CreateNotePayload, Note, NoteChunk, NoteSummary, NoteSummaryRow, NoteWithChunks,
+        NotesListQuery, UpdateNotePayload,
     },
+    routes::ApiError,
+    AppState,
 };
 use axum::{
     extract::{Path, Query, State},
-    http::{request::Parts, StatusCode},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::IntoResponse,
     Json,
 };
-use sqlx::{FromRow, MySql, MySqlPool};
-
-#[derive(Clone)]
-pub struct AppState {
-    pub pool: MySqlPool,
-    pub cache: AppCache,
-}
-
-pub struct ApiError(pub StatusCode, pub String);
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.0,
-            Json(serde_json::json!({
-                "status": "error",
-                "message": self.1
-            })),
-        )
-            .into_response()
-    }
-}
-
-pub async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let ping = sqlx::query("SELECT 1").execute(&state.pool).await.is_ok();
-    Json(serde_json::json!({
-        "status": if ping { "healthy" } else { "degraded" },
-        "service": "be-notenux",
-        "database_connected": ping,
-        "engine": "rust-heavy-lifter",
-        "cache": "moka-bounded-lru",
-    }))
-}
-
-#[derive(FromRow)]
-struct NoteSummaryRow {
-    id: u64,
-    user_id: u64,
-    folder_id: Option<u64>,
-    uuid: String,
-    title: String,
-    category: String,
-    font_family: String,
-    font_size: String,
-    theme_color: String,
-    word_count: u32,
-    char_count: u32,
-    is_pinned: bool,
-    is_favorite: bool,
-    level: u32,
-    xp: u32,
-    created_at: Option<chrono::DateTime<chrono::Utc>>,
-    updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    chunks_count: i64,
-}
+use sqlx::MySql;
 
 pub async fn list_notes(
     State(state): State<AppState>,
-    parts: Parts,
+    user: AuthUser,
     Query(query): Query<NotesListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
+    let has_filter = query.q.is_some()
+        || query.category.is_some()
+        || query.folder_id.is_some()
+        || query.pinned_only.is_some()
+        || query.favorites_only.is_some()
+        || query.sort.is_some();
+
+    // Fast path: cached metadata list if no filters
+    if !has_filter {
+        if let Some(cached) = state.cache.get_notes_list(user.id).await {
+            return Ok(Json(serde_json::json!({
+                "status": "success",
+                "data": cached.as_ref()
+            })));
+        }
+    }
 
     let mut query_builder = sqlx::QueryBuilder::<MySql>::new(
         r#"
@@ -184,6 +143,14 @@ pub async fn list_notes(
         })
         .collect();
 
+    // Cache unfiltered default list
+    if !has_filter {
+        state
+            .cache
+            .insert_notes_list(user.id, summaries.clone())
+            .await;
+    }
+
     Ok(Json(serde_json::json!({
         "status": "success",
         "data": summaries
@@ -192,14 +159,10 @@ pub async fn list_notes(
 
 pub async fn get_note(
     State(state): State<AppState>,
-    parts: Parts,
+    user: AuthUser,
     Path(note_id): Path<u64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
-    // Check bounded LRU cache
+    // Check Moka bounded cache
     if let Some(cached) = state.cache.get_note(user.id, note_id).await {
         return Ok(Json(serde_json::json!({
             "status": "success",
@@ -237,7 +200,7 @@ pub async fn get_note(
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into())
     })?;
 
-    // Store in LRU cache
+    // Store in Moka cache (including initial chunks priority)
     state
         .cache
         .insert_note(user.id, note.clone(), chunks.clone())
@@ -253,164 +216,11 @@ pub async fn get_note(
     })))
 }
 
-pub async fn get_chunks(
-    State(state): State<AppState>,
-    parts: Parts,
-    Path(note_id): Path<u64>,
-    Query(query): Query<ChunksQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
-    // Verify note ownership
-    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM notes WHERE id = ? AND user_id = ?")
-        .bind(note_id)
-        .bind(user.id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
-
-    // Check cache for all chunks first
-    let all_chunks = if let Some(cached) = state.cache.get_note(user.id, note_id).await {
-        cached.chunks.clone()
-    } else {
-        sqlx::query_as::<_, NoteChunk>(
-            "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
-        )
-        .bind(note_id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?
-    };
-
-    let total_chunks = all_chunks.len();
-    let total_bytes: u32 = all_chunks.iter().map(|c| c.byte_size).sum();
-
-    // Progressive / lazy chunk slicing
-    if let Some(limit) = query.limit {
-        let offset = query.offset.unwrap_or(0) as usize;
-        let limit = limit as usize;
-
-        let end = (offset + limit).min(total_chunks);
-        let sliced = if offset < total_chunks {
-            all_chunks[offset..end].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        return Ok(Json(serde_json::json!({
-            "status": "success",
-            "note_id": note_id,
-            "note_uuid": uuid,
-            "total_chunks": total_chunks,
-            "total_bytes": total_bytes,
-            "offset": offset,
-            "limit": limit,
-            "has_more": end < total_chunks,
-            "chunks": sliced,
-        })));
-    }
-
-    // Default: full list
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "note_id": note_id,
-        "note_uuid": uuid,
-        "total_chunks": total_chunks,
-        "total_bytes": total_bytes,
-        "chunks": all_chunks,
-    })))
-}
-
-pub async fn verify_chunks(
-    State(state): State<AppState>,
-    parts: Parts,
-    Path(note_id): Path<u64>,
-) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
-    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM notes WHERE id = ? AND user_id = ?")
-        .bind(note_id)
-        .bind(user.id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
-
-    let chunks = sqlx::query_as::<_, NoteChunk>(
-        "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
-    )
-    .bind(note_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?;
-
-    let total = chunks.len();
-    let mut valid = 0;
-    let mut corrupted = 0;
-    let mut details = Vec::new();
-
-    for chunk in &chunks {
-        let expected_checksum = compute_checksum(&chunk.content);
-        let expected_bytes = chunk.content.len() as u32;
-
-        let checksum_matches = chunk.checksum.as_deref() == Some(&expected_checksum);
-        let bytes_match = chunk.byte_size == expected_bytes;
-        let is_chunk_valid = checksum_matches && bytes_match;
-
-        if is_chunk_valid {
-            valid += 1;
-        } else {
-            corrupted += 1;
-        }
-
-        details.push(serde_json::json!({
-            "chunk_uid": chunk.chunk_uid,
-            "chunk_index": chunk.chunk_index,
-            "is_valid": is_chunk_valid,
-            "checksum_matches": checksum_matches,
-            "bytes_match": bytes_match,
-        }));
-    }
-
-    let all_verified = total > 0 && corrupted == 0;
-    let status_str = if all_verified {
-        "verified"
-    } else if total == 0 {
-        "empty"
-    } else {
-        "corrupted"
-    };
-
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "note_id": note_id,
-        "note_uuid": uuid,
-        "data": {
-            "status": status_str,
-            "verified": all_verified,
-            "is_valid": all_verified,
-            "total_chunks": total,
-            "valid_chunks": valid,
-            "corrupted_chunks": corrupted,
-            "details": details,
-        }
-    })))
-}
-
 pub async fn create_note(
     State(state): State<AppState>,
-    parts: Parts,
+    user: AuthUser,
     Json(payload): Json<CreateNotePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
     let raw_title = payload.title.as_deref().unwrap_or("Catatan Baru").trim();
     let title = if raw_title.is_empty() {
         "Catatan Baru"
@@ -419,7 +229,7 @@ pub async fn create_note(
     };
     let category = payload.category.as_deref().unwrap_or("catatan").trim();
     let content = payload.content.unwrap_or_default();
-    let font_family = payload.font_family.as_deref().unwrap_or("sans");
+    let font_family = payload.font_family.as_deref().unwrap_or("pixel");
     let font_size = payload.font_size.as_deref().unwrap_or("16px");
     let theme_color = payload.theme_color.as_deref().unwrap_or("blue");
     let is_pinned = payload.is_pinned.unwrap_or(false);
@@ -533,6 +343,7 @@ pub async fn create_note(
         updated_at: Some(chrono::Utc::now()),
     };
 
+    // Store in Moka Cache and clear user notes list cache
     state
         .cache
         .insert_note(user.id, created_note.clone(), created_chunks.clone())
@@ -542,7 +353,7 @@ pub async fn create_note(
         StatusCode::CREATED,
         Json(serde_json::json!({
             "status": "success",
-            "message": "Scroll inscribed and chunked into memory matrix!",
+            "message": "Note created and chunked into memory matrix!",
             "data": NoteWithChunks {
                 reading_time: created_note.reading_time(),
                 note: created_note,
@@ -554,14 +365,10 @@ pub async fn create_note(
 
 pub async fn update_note(
     State(state): State<AppState>,
-    parts: Parts,
+    user: AuthUser,
     Path(note_id): Path<u64>,
     Json(payload): Json<UpdateNotePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
     let mut current_note = sqlx::query_as::<_, Note>(
         "SELECT id, user_id, folder_id, uuid, title, category, content, font_family, font_size, theme_color, word_count, char_count, is_pinned, is_favorite, level, xp, created_at, updated_at FROM notes WHERE id = ? AND user_id = ?"
     )
@@ -711,6 +518,7 @@ pub async fn update_note(
     current_note.xp = metrics.xp;
     current_note.updated_at = Some(chrono::Utc::now());
 
+    // Update Moka cache
     state
         .cache
         .insert_note(user.id, current_note.clone(), updated_chunks.clone())
@@ -718,7 +526,7 @@ pub async fn update_note(
 
     Ok(Json(serde_json::json!({
         "status": "success",
-        "message": "Scroll updated and chunks harmonized!",
+        "message": "Note updated and chunks harmonized!",
         "data": NoteWithChunks {
             reading_time: current_note.reading_time(),
             note: current_note,
@@ -729,13 +537,9 @@ pub async fn update_note(
 
 pub async fn delete_note(
     State(state): State<AppState>,
-    parts: Parts,
+    user: AuthUser,
     Path(note_id): Path<u64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
     let mut tx = state.pool.begin().await.map_err(|_| {
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Transaction error".into())
     })?;
@@ -761,23 +565,20 @@ pub async fn delete_note(
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
     })?;
 
+    // Invalidate Moka cache
     state.cache.invalidate_note(user.id, note_id).await;
 
     Ok(Json(serde_json::json!({
         "status": "success",
-        "message": "Scroll banished to the digital void!"
+        "message": "Note deleted successfully!"
     })))
 }
 
 pub async fn toggle_pin(
     State(state): State<AppState>,
-    parts: Parts,
+    user: AuthUser,
     Path(note_id): Path<u64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
     let res = sqlx::query(
         "UPDATE notes SET is_pinned = NOT is_pinned, updated_at = NOW() WHERE id = ? AND user_id = ?",
     )
@@ -802,19 +603,15 @@ pub async fn toggle_pin(
     Ok(Json(serde_json::json!({
         "status": "success",
         "is_pinned": updated_pinned.0,
-        "message": if updated_pinned.0 { "Scroll pinned to top!" } else { "Scroll unpinned!" }
+        "message": if updated_pinned.0 { "Note pinned!" } else { "Note unpinned!" }
     })))
 }
 
 pub async fn toggle_favorite(
     State(state): State<AppState>,
-    parts: Parts,
+    user: AuthUser,
     Path(note_id): Path<u64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
     let res = sqlx::query(
         "UPDATE notes SET is_favorite = NOT is_favorite, updated_at = NOW() WHERE id = ? AND user_id = ?",
     )
@@ -839,20 +636,15 @@ pub async fn toggle_favorite(
     Ok(Json(serde_json::json!({
         "status": "success",
         "is_favorite": updated_fav.0,
-        "message": if updated_fav.0 { "Scroll favorited!" } else { "Scroll unfavorited!" }
+        "message": if updated_fav.0 { "Note favorited!" } else { "Note unfavorited!" }
     })))
 }
 
 pub async fn duplicate_note(
     State(state): State<AppState>,
-    parts: Parts,
+    user: AuthUser,
     Path(note_id): Path<u64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
-    // 1. Fetch source note
     let source_note = sqlx::query_as::<_, Note>(
         "SELECT id, user_id, folder_id, uuid, title, category, content, font_family, font_size, theme_color, word_count, char_count, is_pinned, is_favorite, level, xp, created_at, updated_at FROM notes WHERE id = ? AND user_id = ?"
     )
@@ -863,7 +655,6 @@ pub async fn duplicate_note(
     .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
     .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
 
-    // 2. Fetch source chunks
     let source_chunks = sqlx::query_as::<_, NoteChunk>(
         "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
     )
@@ -916,7 +707,7 @@ pub async fn duplicate_note(
 
     let mut cloned_chunks = Vec::new();
     for ch in source_chunks {
-        let new_chunk_uid = crate::chunker::generate_chunk_uid();
+        let new_chunk_uid = generate_chunk_uid();
         let meta_json = ch.metadata.as_ref().map(|m| m.to_string());
         let chunk_res = sqlx::query(
             r#"
@@ -990,7 +781,7 @@ pub async fn duplicate_note(
         StatusCode::CREATED,
         Json(serde_json::json!({
             "status": "success",
-            "message": "Scroll duplicated into the memory matrix!",
+            "message": "Note duplicated successfully!",
             "data": NoteWithChunks {
                 reading_time: cloned_note.reading_time(),
                 note: cloned_note,
@@ -998,276 +789,4 @@ pub async fn duplicate_note(
             }
         })),
     ))
-}
-
-pub async fn update_chunk(
-    State(state): State<AppState>,
-    parts: Parts,
-    Path((note_id, chunk_id)): Path<(u64, u64)>,
-    Json(payload): Json<UpdateChunkPayload>,
-) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
-    // Verify note ownership
-    let _ = sqlx::query("SELECT id FROM notes WHERE id = ? AND user_id = ?")
-        .bind(note_id)
-        .bind(user.id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
-
-    let chunk_type = payload
-        .chunk_type
-        .unwrap_or_else(|| detect_chunk_type(&payload.content));
-    let byte_size = payload.content.len() as u32;
-    let checksum = compute_checksum(&payload.content);
-
-    let mut tx = state.pool.begin().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Transaction error".into())
-    })?;
-
-    let update_res = sqlx::query(
-        r#"
-        UPDATE note_chunks
-        SET content = ?, chunk_type = ?, byte_size = ?, checksum = ?, updated_at = NOW()
-        WHERE id = ? AND note_id = ?
-        "#,
-    )
-    .bind(&payload.content)
-    .bind(&chunk_type)
-    .bind(byte_size)
-    .bind(&checksum)
-    .bind(chunk_id)
-    .bind(note_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Chunk update failed".into()))?;
-
-    if update_res.rows_affected() == 0 {
-        return Err(ApiError(StatusCode::NOT_FOUND, "Chunk not found".into()));
-    }
-
-    // Reassemble full note content
-    let all_chunks = sqlx::query_as::<_, NoteChunk>(
-        "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
-    )
-    .bind(note_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
-
-    let reassembled = all_chunks
-        .iter()
-        .map(|c| c.content.as_str())
-        .collect::<Vec<_>>()
-        .join("");
-
-    let metrics = calculate_metrics(&reassembled);
-
-    sqlx::query(
-        r#"
-        UPDATE notes
-        SET content = ?, word_count = ?, char_count = ?, xp = ?, level = ?, updated_at = NOW()
-        WHERE id = ?
-        "#,
-    )
-    .bind(&reassembled)
-    .bind(metrics.word_count)
-    .bind(metrics.char_count)
-    .bind(metrics.xp)
-    .bind(metrics.level)
-    .bind(note_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Note update failed".into()))?;
-
-    tx.commit().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
-    })?;
-
-    state.cache.invalidate_note(user.id, note_id).await;
-
-    let updated_chunk = all_chunks.into_iter().find(|c| c.id == chunk_id);
-
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "message": format!("Shard {} updated & checksum recomputed!", chunk_id),
-        "data": {
-            "chunk": updated_chunk,
-            "note_id": note_id,
-        }
-    })))
-}
-
-pub async fn delete_chunk(
-    State(state): State<AppState>,
-    parts: Parts,
-    Path((note_id, chunk_id)): Path<(u64, u64)>,
-) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
-    // Verify note ownership
-    let _ = sqlx::query("SELECT id FROM notes WHERE id = ? AND user_id = ?")
-        .bind(note_id)
-        .bind(user.id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
-
-    let mut tx = state.pool.begin().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Transaction error".into())
-    })?;
-
-    let del_res = sqlx::query("DELETE FROM note_chunks WHERE id = ? AND note_id = ?")
-        .bind(chunk_id)
-        .bind(note_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Delete failed".into()))?;
-
-    if del_res.rows_affected() == 0 {
-        return Err(ApiError(StatusCode::NOT_FOUND, "Chunk not found".into()));
-    }
-
-    // Re-index remaining chunks
-    let remaining = sqlx::query_as::<_, NoteChunk>(
-        "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
-    )
-    .bind(note_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Query failed".into()))?;
-
-    for (new_idx, ch) in remaining.iter().enumerate() {
-        if ch.chunk_index != new_idx as u32 {
-            sqlx::query("UPDATE note_chunks SET chunk_index = ? WHERE id = ?")
-                .bind(new_idx as u32)
-                .bind(ch.id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Reindex failed".into()))?;
-        }
-    }
-
-    // Reassemble and update note
-    let reassembled = remaining
-        .iter()
-        .map(|c| c.content.as_str())
-        .collect::<Vec<_>>()
-        .join("");
-
-    let metrics = calculate_metrics(&reassembled);
-
-    sqlx::query(
-        r#"
-        UPDATE notes
-        SET content = ?, word_count = ?, char_count = ?, xp = ?, level = ?, updated_at = NOW()
-        WHERE id = ?
-        "#,
-    )
-    .bind(&reassembled)
-    .bind(metrics.word_count)
-    .bind(metrics.char_count)
-    .bind(metrics.xp)
-    .bind(metrics.level)
-    .bind(note_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Note update failed".into()))?;
-
-    tx.commit().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
-    })?;
-
-    state.cache.invalidate_note(user.id, note_id).await;
-
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "message": "Chunk deleted and scroll reassembled!"
-    })))
-}
-
-pub async fn reorder_chunks(
-    State(state): State<AppState>,
-    parts: Parts,
-    Path(note_id): Path<u64>,
-    Json(payload): Json<ReorderChunksPayload>,
-) -> Result<impl IntoResponse, ApiError> {
-    let user = authenticate(&parts, &state.pool, &state.cache)
-        .await
-        .map_err(|e| ApiError(StatusCode::UNAUTHORIZED, format!("{:?}", e)))?;
-
-    // Verify note ownership
-    let _ = sqlx::query("SELECT id FROM notes WHERE id = ? AND user_id = ?")
-        .bind(note_id)
-        .bind(user.id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
-
-    let mut tx = state.pool.begin().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Transaction error".into())
-    })?;
-
-    for (new_index, chunk_id) in payload.order.iter().enumerate() {
-        sqlx::query("UPDATE note_chunks SET chunk_index = ? WHERE id = ? AND note_id = ?")
-            .bind(new_index as u32)
-            .bind(chunk_id)
-            .bind(note_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Reorder failed".into()))?;
-    }
-
-    // Reassemble in new order
-    let reordered = sqlx::query_as::<_, NoteChunk>(
-        "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
-    )
-    .bind(note_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
-
-    let reassembled = reordered
-        .iter()
-        .map(|c| c.content.as_str())
-        .collect::<Vec<_>>()
-        .join("");
-
-    let metrics = calculate_metrics(&reassembled);
-
-    sqlx::query(
-        r#"
-        UPDATE notes
-        SET content = ?, word_count = ?, char_count = ?, xp = ?, level = ?, updated_at = NOW()
-        WHERE id = ?
-        "#,
-    )
-    .bind(&reassembled)
-    .bind(metrics.word_count)
-    .bind(metrics.char_count)
-    .bind(metrics.xp)
-    .bind(metrics.level)
-    .bind(note_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Note update failed".into()))?;
-
-    tx.commit().await.map_err(|_| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into())
-    })?;
-
-    state.cache.invalidate_note(user.id, note_id).await;
-
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "message": "Chunks successfully reordered and note reassembled!"
-    })))
 }

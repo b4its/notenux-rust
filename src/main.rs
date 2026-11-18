@@ -12,17 +12,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::from_env();
-    tracing::info!("Starting Notenux Rust Heavy Lifter...");
-    tracing::info!("Configured MySQL connections limit: {}", config.max_db_connections);
+    tracing::info!("Starting Notenux Rust Backend API...");
     tracing::info!(
-        "Configured Moka Cache limit: {} MB",
+        "Database pool: max {} conns, min {} conns, acquire timeout {}s",
+        config.max_db_connections,
+        config.min_db_connections,
+        config.acquire_timeout_secs
+    );
+    tracing::info!(
+        "Bounded Moka cache limit: {} MB",
         config.cache_limit_bytes / (1024 * 1024)
     );
 
     let app = create_app(&config).await?;
 
     let addr = format!("{}:{}", config.host, config.port);
-    tracing::info!("Notenux Rust service listening on http://{}", addr);
+    tracing::info!("Notenux Backend API running at http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

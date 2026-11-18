@@ -2,49 +2,57 @@ pub mod auth;
 pub mod cache;
 pub mod chunker;
 pub mod config;
-pub mod handlers;
+pub mod db;
 pub mod models;
+pub mod routes;
 
 use axum::{
     http::{header, HeaderValue, Method},
-    routing::{get, post, put},
     Router,
 };
 use cache::AppCache;
 use config::Config;
-use handlers::*;
-use sqlx::mysql::MySqlPoolOptions;
-use std::time::Duration;
+use sqlx::MySqlPool;
 use tower_http::{
     compression::CompressionLayer,
     cors::CorsLayer,
     trace::TraceLayer,
 };
 
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: MySqlPool,
+    pub cache: AppCache,
+}
+
 pub async fn create_app(config: &Config) -> Result<Router, Box<dyn std::error::Error>> {
-    // Limit pool strictly to max_db_connections (5) for shared hosting safety
-    let pool = MySqlPoolOptions::new()
-        .max_connections(config.max_db_connections)
-        .min_connections(1)
-        .acquire_timeout(Duration::from_secs(5))
-        .idle_timeout(Duration::from_secs(300))
-        .connect(&config.database_url)
-        .await?;
+    // 1. Initialize DB Pool via modular db module (max 5 conns, 5s timeout)
+    let pool = db::init_pool(config).await?;
 
-    tracing::info!("Connected to MySQL database successfully.");
-
-    // Bounded In-Memory LRU Cache with Moka
+    // 2. Bounded In-Memory Cache with Moka (45 MB limit, 30 min TTL, initial chunk priority)
     let cache = AppCache::new(config.cache_limit_bytes);
 
     let state = AppState { pool, cache };
 
-    // Setup CORS for Svelte frontend (http://localhost:5999)
+    // 3. Network Middleware: CorsLayer (http://localhost:5173, https://app.notenux.oryphem.com)
+    let mut allowed_origins = Vec::new();
+    for orig in [
+        "http://localhost:5173",
+        "https://app.notenux.oryphem.com",
+        "http://127.0.0.1:5173",
+        "http://localhost:5999",
+        "http://127.0.0.1:5999",
+        config.cors_origin.as_str(),
+    ] {
+        if let Ok(hv) = orig.parse::<HeaderValue>() {
+            if !allowed_origins.contains(&hv) {
+                allowed_origins.push(hv);
+            }
+        }
+    }
+
     let cors = CorsLayer::new()
-        .allow_origin([
-            config.cors_origin.parse::<HeaderValue>()?,
-            "http://127.0.0.1:5999".parse::<HeaderValue>()?,
-            "http://localhost:5999".parse::<HeaderValue>()?,
-        ])
+        .allow_origin(allowed_origins)
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -54,8 +62,8 @@ pub async fn create_app(config: &Config) -> Result<Router, Box<dyn std::error::E
         ])
         .allow_headers([
             header::AUTHORIZATION,
-            header::ACCEPT,
             header::CONTENT_TYPE,
+            header::ACCEPT,
             header::COOKIE,
             header::HeaderName::from_static("x-dev-user-id"),
             header::HeaderName::from_static("x-session-id"),
@@ -64,27 +72,10 @@ pub async fn create_app(config: &Config) -> Result<Router, Box<dyn std::error::E
         ])
         .allow_credentials(true);
 
-    // HTTP Compression with Gzip and Brotli
+    // 4. Network Middleware: CompressionLayer (Gzip & Brotli)
     let compression = CompressionLayer::new().gzip(true).br(true);
 
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/api/health", get(health_handler))
-        .route("/api/notes", get(list_notes).post(create_note))
-        .route(
-            "/api/notes/{id}",
-            get(get_note).put(update_note).delete(delete_note),
-        )
-        .route("/api/notes/{id}/pin", post(toggle_pin))
-        .route("/api/notes/{id}/favorite", post(toggle_favorite))
-        .route("/api/notes/{id}/duplicate", post(duplicate_note))
-        .route("/api/notes/{id}/chunks", get(get_chunks))
-        .route("/api/notes/{id}/chunks/verify", get(verify_chunks))
-        .route("/api/notes/{id}/chunks/reorder", post(reorder_chunks))
-        .route(
-            "/api/notes/{id}/chunks/{chunk_id}",
-            put(update_chunk).delete(delete_chunk),
-        )
+    let app = routes::create_routes()
         .layer(cors)
         .layer(compression)
         .layer(TraceLayer::new_for_http())

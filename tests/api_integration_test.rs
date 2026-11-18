@@ -501,6 +501,15 @@ async fn test_large_plain_note_cursor_round_trip() {
     assert_eq!(response.status(), StatusCode::OK);
     let updated: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(updated["data"]["chunk"]["content"].as_str().unwrap().len(), large_content.len());
+    for _ in 0..2 {
+        let get = Request::builder().uri(format!("/api/notes/{note_id}"))
+            .header(header::AUTHORIZATION, token).body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let note: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(note["data"]["chunks"][0]["content"], large_content);
+        assert_eq!(note["data"]["content"].as_str().unwrap().len(), large_content.len() + 200_000);
+    }
     let delete = Request::builder().method("DELETE").uri(format!("/api/notes/{note_id}"))
         .header(header::AUTHORIZATION, token).body(Body::empty()).unwrap();
     assert_eq!(app.oneshot(delete).await.unwrap().status(), StatusCode::OK);

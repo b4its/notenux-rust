@@ -14,6 +14,13 @@ use axum::{
     Json,
 };
 use sqlx::MySql;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct NoteDetailResponse {
+    status: &'static str,
+    data: NoteWithChunks,
+}
 
 pub async fn list_notes(
     State(state): State<AppState>,
@@ -164,14 +171,14 @@ pub async fn get_note(
 ) -> Result<impl IntoResponse, ApiError> {
     // Check Moka bounded cache
     if let Some(cached) = state.cache.get_note(user.id, note_id).await {
-        return Ok(Json(serde_json::json!({
-            "status": "success",
-            "data": NoteWithChunks {
+        return Ok(Json(NoteDetailResponse {
+            status: "success",
+            data: NoteWithChunks {
                 reading_time: cached.note.reading_time(),
                 note: cached.note.clone(),
                 chunks: cached.chunks.clone(),
-            }
-        })));
+            },
+        }));
     }
 
     // Query Note
@@ -203,17 +210,17 @@ pub async fn get_note(
     // Store in Moka cache (including initial chunks priority)
     state
         .cache
-        .insert_note(user.id, note.clone(), chunks.clone())
+        .insert_note(user.id, &note, &chunks)
         .await;
 
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "data": NoteWithChunks {
+    Ok(Json(NoteDetailResponse {
+        status: "success",
+        data: NoteWithChunks {
             reading_time: note.reading_time(),
             note,
             chunks,
-        }
-    })))
+        },
+    }))
 }
 
 pub async fn create_note(
@@ -346,7 +353,7 @@ pub async fn create_note(
     // Store in Moka Cache and clear user notes list cache
     state
         .cache
-        .insert_note(user.id, created_note.clone(), created_chunks.clone())
+        .insert_note(user.id, &created_note, &created_chunks)
         .await;
 
     Ok((
@@ -521,7 +528,7 @@ pub async fn update_note(
     // Update Moka cache
     state
         .cache
-        .insert_note(user.id, current_note.clone(), updated_chunks.clone())
+        .insert_note(user.id, &current_note, &updated_chunks)
         .await;
 
     Ok(Json(serde_json::json!({
@@ -774,7 +781,7 @@ pub async fn duplicate_note(
 
     state
         .cache
-        .insert_note(user.id, cloned_note.clone(), cloned_chunks.clone())
+        .insert_note(user.id, &cloned_note, &cloned_chunks)
         .await;
 
     Ok((

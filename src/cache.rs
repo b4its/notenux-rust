@@ -38,8 +38,19 @@ fn compute_summaries_byte_size(summaries: &[NoteSummary]) -> u32 {
 }
 
 fn weight<T: serde::Serialize + ?Sized>(value: &T) -> u32 {
-    let bytes = serde_json::to_vec(value).map_or(u32::MAX as usize, |v| v.len());
-    u32::try_from(bytes.saturating_mul(2).saturating_add(256)).unwrap_or(u32::MAX)
+    struct ByteCounter(usize);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut counter = ByteCounter(0);
+    if serde_json::to_writer(&mut counter, value).is_err() {
+        return u32::MAX;
+    }
+    u32::try_from(counter.0.saturating_mul(2).saturating_add(256)).unwrap_or(u32::MAX)
 }
 
 #[derive(Clone)]
@@ -130,13 +141,23 @@ impl AppCache {
         self.notes.get(&(user_id, note_id)).await
     }
 
-    pub async fn insert_note(&self, user_id: u64, note: Note, chunks: Vec<NoteChunk>) {
+    pub async fn insert_note(&self, user_id: u64, note: &Note, chunks: &[NoteChunk]) {
         let note_id = note.id;
         self.pages.invalidate(&(user_id, note_id)).await;
         self.initial_chunks.invalidate(&(user_id, note_id)).await;
 
-        let detail = Arc::new(CachedNoteData::new(note, chunks));
-        self.notes.insert((user_id, note_id), detail).await;
+        // Avoid cloning large full notes (content is also present in chunks)
+        // only for Moka to immediately evict them under the weighted quota.
+        let content_bytes = chunks.iter().fold(
+            note.content.as_ref().map_or(0usize, String::len),
+            |total, chunk| total.saturating_add(chunk.content.len()),
+        );
+        if content_bytes <= 1024 * 1024 {
+            let detail = Arc::new(CachedNoteData::new(note.clone(), chunks.to_vec()));
+            self.notes.insert((user_id, note_id), detail).await;
+        } else {
+            self.notes.invalidate(&(user_id, note_id)).await;
+        }
 
         // Invalidate list of notes so new or updated note is reflected
         self.notes_list.remove(&user_id).await;
@@ -193,5 +214,17 @@ impl AppCache {
 
     pub async fn invalidate_user_notes(&self, user_id: u64) {
         self.notes_list.remove(&user_id).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::weight;
+
+    #[test]
+    fn streaming_weight_matches_serialized_size() {
+        let value = serde_json::json!({"unicode": "🦀\n\"quoted\"", "text": "x".repeat(2_000_000)});
+        let expected = serde_json::to_vec(&value).unwrap().len() * 2 + 256;
+        assert_eq!(weight(&value), expected as u32);
     }
 }

@@ -376,6 +376,24 @@ async fn test_full_specification_workflow() {
         .unwrap();
     let put_array_resp = app.clone().oneshot(put_array_req).await.unwrap();
     assert_eq!(put_array_resp.status(), StatusCode::OK);
+    let payload: Value = serde_json::from_slice(&put_array_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let first_id = payload["chunks"][0]["id"].as_u64().unwrap();
+    let update_req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/notes/{note_id}/chunks/{first_id}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"content":"<p>Updated chunk</p>"}"#)).unwrap();
+    let response = app.clone().oneshot(update_req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(updated["data"]["chunk"]["content"], "<p>Updated chunk</p>");
+    let get_req = Request::builder().uri(format!("/api/notes/{note_id}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(get_req).await.unwrap();
+    let note: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(note["data"]["content"], "<p>Updated chunk</p><pre><code>let level = 99;</code></pre>");
 
     // 9. POST /api/notes/{note_id}/pin and /favorite
     let pin_req = Request::builder()
@@ -428,4 +446,39 @@ async fn test_full_specification_workflow() {
         .unwrap();
     let delete_resp = app.clone().oneshot(delete_req).await.unwrap();
     assert_eq!(delete_resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_large_plain_note_cursor_round_trip() {
+    let app = create_app(&Config::from_env()).await.expect("test database required");
+    let token = "Bearer 1|sanctum_test_token_1234567890abcdef";
+    let content = format!("{}🦀\n\n{}", "a".repeat(150_000), "b".repeat(150_000));
+    let create = Request::builder().method("POST").uri("/api/notes")
+        .header(header::AUTHORIZATION, token).header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({"title":"Cursor performance fixture", "content":content}).to_string())).unwrap();
+    let response = app.clone().oneshot(create).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let value: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let note_id = value["data"]["id"].as_u64().unwrap();
+    let mut reconstructed = String::new();
+    let mut cursor = String::new();
+    let mut pages = 0;
+    loop {
+        let request = Request::builder().uri(format!("/api/notes/{note_id}/chunks?limit=50&lightweight=true{cursor}"))
+            .header(header::AUTHORIZATION, token).body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let chunks = page["chunks"].as_array().unwrap();
+        for chunk in chunks { reconstructed.push_str(chunk["content"].as_str().unwrap()); }
+        pages += 1;
+        if !page["has_more"].as_bool().unwrap() { break; }
+        let last = chunks.last().unwrap();
+        cursor = format!("&after_index={}&after_id={}", last["chunk_index"], last["id"]);
+    }
+    assert!(pages > 1);
+    assert_eq!(reconstructed, content);
+    let delete = Request::builder().method("DELETE").uri(format!("/api/notes/{note_id}"))
+        .header(header::AUTHORIZATION, token).body(Body::empty()).unwrap();
+    assert_eq!(app.oneshot(delete).await.unwrap().status(), StatusCode::OK);
 }

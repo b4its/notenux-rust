@@ -13,6 +13,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use futures_util::TryStreamExt;
 
 pub async fn get_chunks(
     State(state): State<AppState>,
@@ -343,15 +344,6 @@ pub async fn update_single_chunk(
     Path((note_id, chunk_id)): Path<(u64, u64)>,
     Json(payload): Json<UpdateChunkPayload>,
 ) -> Result<axum::response::Response, ApiError> {
-    // 1. Verify note ownership
-    let _ = sqlx::query("SELECT id FROM notes WHERE id = ? AND user_id = ?")
-        .bind(note_id)
-        .bind(user.id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
-
     let chunk_type = payload
         .chunk_type
         .unwrap_or_else(|| detect_chunk_type(&payload.content));
@@ -364,6 +356,15 @@ pub async fn update_single_chunk(
             "Transaction error".into(),
         )
     })?;
+
+    // Serialize concurrent chunk edits for the same note before reassembling it.
+    sqlx::query("SELECT id FROM notes WHERE id = ? AND user_id = ? FOR UPDATE")
+        .bind(note_id)
+        .bind(user.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
 
     let update_res = sqlx::query(
         r#"
@@ -391,20 +392,18 @@ pub async fn update_single_chunk(
         return Err(ApiError(StatusCode::NOT_FOUND, "Chunk not found".into()));
     }
 
-    // Reassemble full note content
-    let all_chunks = sqlx::query_as::<_, NoteChunk>(
-        "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
-    )
-    .bind(note_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
-
-    let reassembled = all_chunks
-        .iter()
-        .map(|c| c.content.as_str())
-        .collect::<Vec<_>>()
-        .join("");
+    // Stream only content instead of buffering every full chunk record.
+    let mut reassembled = String::new();
+    {
+        let mut rows = sqlx::query_as::<_, (String,)>(
+            "SELECT content FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC, id ASC"
+        ).bind(note_id).fetch(&mut *tx);
+        while let Some((content,)) = rows.try_next().await
+            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?
+        {
+            reassembled.push_str(&content);
+        }
+    }
 
     let metrics = calculate_metrics(&reassembled);
 
@@ -430,14 +429,17 @@ pub async fn update_single_chunk(
         )
     })?;
 
+    let updated_chunk = sqlx::query_as::<_, NoteChunk>(
+        "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE id = ? AND note_id = ?"
+    ).bind(chunk_id).bind(note_id).fetch_one(&mut *tx).await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunk".into()))?;
+
     tx.commit()
         .await
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Commit failed".into()))?;
 
     // Invalidate Moka cache
     state.cache.invalidate_note(user.id, note_id).await;
-
-    let updated_chunk = all_chunks.into_iter().find(|c| c.id == chunk_id);
 
     Ok(Json(serde_json::json!({
         "status": "success",

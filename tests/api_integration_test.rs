@@ -492,6 +492,15 @@ async fn test_large_plain_note_cursor_round_trip() {
     let page: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(page["chunks"].as_array().unwrap().len(), 1);
     assert_eq!(page["has_more"], true);
+    let chunk_id = page["chunks"][0]["id"].as_u64().unwrap();
+    let large_content = "x".repeat(2 * 1024 * 1024 + 1024);
+    let edit = Request::builder().method("PUT").uri(format!("/api/notes/{note_id}/chunks/{chunk_id}"))
+        .header(header::AUTHORIZATION, token).header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({"content": large_content}).to_string())).unwrap();
+    let response = app.clone().oneshot(edit).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(updated["data"]["chunk"]["content"].as_str().unwrap().len(), large_content.len());
     let delete = Request::builder().method("DELETE").uri(format!("/api/notes/{note_id}"))
         .header(header::AUTHORIZATION, token).body(Body::empty()).unwrap();
     assert_eq!(app.oneshot(delete).await.unwrap().status(), StatusCode::OK);

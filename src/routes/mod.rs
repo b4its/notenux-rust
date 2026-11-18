@@ -4,6 +4,7 @@ pub mod notes;
 pub mod search;
 
 use axum::{
+    extract::DefaultBodyLimit,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -52,7 +53,8 @@ pub fn create_routes() -> Router<AppState> {
         .route("/api/notes/{id}/chunks/reorder", post(chunks::reorder_chunks))
         .route(
             "/api/notes/{id}/chunks/{chunk_id}",
-            put(chunks::update_single_chunk).delete(chunks::delete_chunk),
+            put(chunks::update_single_chunk).delete(chunks::delete_chunk)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
 }
 

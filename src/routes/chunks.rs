@@ -14,6 +14,35 @@ use axum::{
     Json,
 };
 use futures_util::TryStreamExt;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct ChunkPageResponse {
+    status: &'static str,
+    note_id: u64,
+    note_uuid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_chunks: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<i64>,
+    offset: u32,
+    limit: u32,
+    has_more: bool,
+    chunks: Vec<NoteChunk>,
+}
+
+#[derive(Serialize)]
+struct UpdatedChunkData {
+    chunk: NoteChunk,
+    note_id: u64,
+}
+
+#[derive(Serialize)]
+struct UpdatedChunkResponse {
+    status: &'static str,
+    message: String,
+    data: UpdatedChunkData,
+}
 
 // Limit normal pages by bytes as well as by chunk count. A single legacy chunk
 // may exceed this budget and must still be returned intact.
@@ -83,11 +112,11 @@ pub async fn get_chunks(
             .build_query_as::<NoteChunk>().fetch_all(&state.pool).await
             .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
         let has_more = !chunks.is_empty() && sizes.len() > chunks.len();
-        return Ok(Json(serde_json::json!({
-            "status": "success", "note_id": note_id, "note_uuid": uuid,
-            "offset": offset, "limit": limit, "has_more": has_more,
-            "chunks": chunks,
-        })));
+        return Ok(Json(ChunkPageResponse {
+            status: "success", note_id, note_uuid: uuid,
+            total_chunks: None, total_bytes: None,
+            offset, limit, has_more, chunks,
+        }));
     }
     if query.after_index.is_some() || query.after_id.is_some() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "Cursor requires lightweight mode".into()));
@@ -138,13 +167,12 @@ pub async fn get_chunks(
             chunks
         }
     };
-    Ok(Json(serde_json::json!({
-        "status": "success", "note_id": note_id, "note_uuid": uuid,
-        "total_chunks": total_chunks, "total_bytes": total_bytes,
-        "offset": offset, "limit": limit,
-        "has_more": u64::from(offset) + (chunks.len() as u64) < total_chunks as u64,
-        "chunks": chunks,
-    })))
+    let has_more = u64::from(offset) + (chunks.len() as u64) < total_chunks as u64;
+    Ok(Json(ChunkPageResponse {
+        status: "success", note_id, note_uuid: uuid,
+        total_chunks: Some(total_chunks), total_bytes: Some(total_bytes),
+        offset, limit, has_more, chunks,
+    }))
 }
 
 /// PUT /api/notes/{note_id}/chunks: updates or synchronizes chunks for a note and invalidates cache
@@ -464,14 +492,11 @@ pub async fn update_single_chunk(
     // Invalidate Moka cache
     state.cache.invalidate_note(user.id, note_id).await;
 
-    Ok(Json(serde_json::json!({
-        "status": "success",
-        "message": format!("Shard {} updated & checksum recomputed!", chunk_id),
-        "data": {
-            "chunk": updated_chunk,
-            "note_id": note_id,
-        }
-    }))
+    Ok(Json(UpdatedChunkResponse {
+        status: "success",
+        message: format!("Shard {} updated & checksum recomputed!", chunk_id),
+        data: UpdatedChunkData { chunk: updated_chunk, note_id },
+    })
     .into_response())
 }
 

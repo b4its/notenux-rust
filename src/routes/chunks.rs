@@ -48,9 +48,11 @@ struct UpdatedChunkResponse {
 // may exceed this budget and must still be returned intact.
 const PAGE_BYTE_BUDGET: u64 = 256 * 1024;
 
-fn chunk_page_query(note_id: u64, query: &ChunksQuery, select: &str, limit: u32) -> sqlx::QueryBuilder<'static, sqlx::MySql> {
+fn chunk_page_query(note_id: u64, user_id: u64, query: &ChunksQuery, select: &str, limit: u32) -> sqlx::QueryBuilder<'static, sqlx::MySql> {
     let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(select.to_owned());
     builder.push_bind(note_id);
+    builder.push(" AND EXISTS (SELECT 1 FROM notes WHERE notes.id = note_chunks.note_id AND notes.user_id = ")
+        .push_bind(user_id).push(")");
     if let (Some(index), Some(id)) = (query.after_index, query.after_id) {
         builder.push(" AND (chunk_index > ").push_bind(index)
             .push(" OR (chunk_index = ").push_bind(index)
@@ -69,13 +71,6 @@ pub async fn get_chunks(
     Path(note_id): Path<u64>,
     Query(query): Query<ChunksQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM notes WHERE id = ? AND user_id = ?")
-        .bind(note_id)
-        .bind(user.id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(2);
     if limit == 0 || limit > 100 {
@@ -93,11 +88,40 @@ pub async fn get_chunks(
         }
         // Fetch index metadata first: looking ahead must not download an
         // arbitrarily large LONGTEXT chunk just to determine has_more.
-        let sizes = chunk_page_query(note_id, &query,
-            "SELECT chunk_index, id, byte_size FROM note_chunks WHERE note_id = ", limit + 1)
-            .build_query_as::<(u32, u64, u32)>()
-            .fetch_all(&state.pool).await
-            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunk metadata".into()))?;
+        let (uuid, sizes) = if offset == 0 {
+            // One indexed query verifies ownership and reads only small chunk metadata.
+            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "SELECT n.uuid, c.chunk_index, c.id, c.byte_size FROM notes n LEFT JOIN note_chunks c ON c.note_id = n.id"
+            );
+            if let (Some(index), Some(id)) = (query.after_index, query.after_id) {
+                builder.push(" AND (c.chunk_index > ").push_bind(index)
+                    .push(" OR (c.chunk_index = ").push_bind(index)
+                    .push(" AND c.id > ").push_bind(id).push("))");
+            }
+            builder.push(" WHERE n.id = ").push_bind(note_id)
+                .push(" AND n.user_id = ").push_bind(user.id)
+                .push(" ORDER BY c.chunk_index ASC, c.id ASC LIMIT ").push_bind(limit + 1);
+            let rows = builder.build_query_as::<(String, Option<u32>, Option<u64>, Option<u32>)>()
+                .fetch_all(&state.pool).await
+                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunk metadata".into()))?;
+            let uuid = rows.first().map(|row| row.0.clone())
+                .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
+            let sizes: Vec<(u32, u64, u32)> = rows.into_iter()
+                .filter_map(|(_, index, id, size)| Some((index?, id?, size?))).collect();
+            (uuid, sizes)
+        } else {
+            // Preserve the legacy offset form, including 404 for missing notes.
+            let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM notes WHERE id = ? AND user_id = ?")
+                .bind(note_id).bind(user.id).fetch_optional(&state.pool).await
+                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
+                .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
+            let sizes = chunk_page_query(note_id, user.id, &query,
+                "SELECT chunk_index, id, byte_size FROM note_chunks WHERE note_id = ", limit + 1)
+                .build_query_as::<(u32, u64, u32)>()
+                .fetch_all(&state.pool).await
+                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunk metadata".into()))?;
+            (uuid, sizes)
+        };
         let mut page_size = 0u32;
         let mut total = 0u64;
         for &(_, _, size) in sizes.iter().take(limit as usize) {
@@ -107,10 +131,14 @@ pub async fn get_chunks(
             total += u64::from(size);
             page_size += 1;
         }
-        let chunks = chunk_page_query(note_id, &query,
-            "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ", page_size)
-            .build_query_as::<NoteChunk>().fetch_all(&state.pool).await
-            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?;
+        let chunks = if page_size == 0 {
+            Vec::new()
+        } else {
+            chunk_page_query(note_id, user.id, &query,
+                "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ", page_size)
+                .build_query_as::<NoteChunk>().fetch_all(&state.pool).await
+                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load chunks".into()))?
+        };
         let has_more = !chunks.is_empty() && sizes.len() > chunks.len();
         return Ok(Json(ChunkPageResponse {
             status: "success", note_id, note_uuid: uuid,
@@ -121,6 +149,10 @@ pub async fn get_chunks(
     if query.after_index.is_some() || query.after_id.is_some() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "Cursor requires lightweight mode".into()));
     }
+    let (uuid,): (String,) = sqlx::query_as("SELECT uuid FROM notes WHERE id = ? AND user_id = ?")
+        .bind(note_id).bind(user.id).fetch_optional(&state.pool).await
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Database error".into()))?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Note not found".into()))?;
     let (total_chunks, total_bytes): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), CAST(COALESCE(SUM(byte_size), 0) AS SIGNED) FROM note_chunks WHERE note_id = ?"
     ).bind(note_id).fetch_one(&state.pool).await

@@ -134,6 +134,72 @@ async fn test_invalid_sanctum_token_rejected() {
 }
 
 #[tokio::test]
+async fn lightweight_chunk_page_handles_empty_missing_and_foreign_notes() {
+    use be_notenux::{auth::hash_token, cache::AppCache, db, routes, AppState};
+    let pool = db::init_pool(&Config::from_env()).await.unwrap();
+    let fixture_pool = pool.clone();
+    let cache = AppCache::new(1024 * 1024);
+    cache.cache_user(format!("101:{}", hash_token("owner-secret")), 1, None).await;
+    cache.cache_user(format!("102:{}", hash_token("other-secret")), u64::MAX, None).await;
+    let app = routes::create_routes().with_state(AppState { pool, cache });
+    let create = Request::builder().method("POST").uri("/api/notes")
+        .header(header::AUTHORIZATION, "Bearer 101|owner-secret")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"title":"Cursor isolation fixture"}"#)).unwrap();
+    let response = app.clone().oneshot(create).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let value: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id = value["data"]["id"].as_u64().unwrap();
+    let clear = Request::builder().method("PUT").uri(format!("/api/notes/{id}/chunks"))
+        .header(header::AUTHORIZATION, "Bearer 101|owner-secret")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"chunks":[]}"#)).unwrap();
+    assert_eq!(app.clone().oneshot(clear).await.unwrap().status(), StatusCode::OK);
+    for uri in [
+        format!("/api/notes/{id}/chunks?lightweight=true"),
+        format!("/api/notes/{id}/chunks?lightweight=true&after_index=1&after_id=1"),
+        format!("/api/notes/{id}/chunks?lightweight=true&offset=3"),
+    ] {
+        let request = Request::builder().uri(uri)
+            .header(header::AUTHORIZATION, "Bearer 101|owner-secret").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert!(page["chunks"].as_array().unwrap().is_empty());
+        assert_eq!(page["has_more"], false);
+    }
+    for text in ["first", "second"] {
+        sqlx::query("INSERT INTO note_chunks (note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, created_at, updated_at) VALUES (?, ?, 0, 'paragraph', ?, ?, NOW(), NOW())")
+            .bind(id).bind(format!("chk_{}", uuid::Uuid::new_v4().simple())).bind(text).bind(text.len() as u32)
+            .execute(&fixture_pool).await.unwrap();
+    }
+    let request = Request::builder().uri(format!("/api/notes/{id}/chunks?lightweight=true&limit=1"))
+        .header(header::AUTHORIZATION, "Bearer 101|owner-secret").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let page: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["chunks"][0]["content"], "first");
+    assert_eq!(page["has_more"], true);
+    let cursor = page["chunks"][0]["id"].as_u64().unwrap();
+    let request = Request::builder().uri(format!("/api/notes/{id}/chunks?lightweight=true&limit=1&after_index=0&after_id={cursor}"))
+        .header(header::AUTHORIZATION, "Bearer 101|owner-secret").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let page: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["chunks"][0]["content"], "second");
+    assert_eq!(page["has_more"], false);
+    for (uri, token) in [
+        (format!("/api/notes/{id}/chunks?lightweight=true"), "Bearer 102|other-secret"),
+        (format!("/api/notes/{id}/chunks?lightweight=true&offset=3"), "Bearer 102|other-secret"),
+        ("/api/notes/18446744073709551615/chunks?lightweight=true".to_string(), "Bearer 101|owner-secret"),
+    ] {
+        let request = Request::builder().uri(uri).header(header::AUTHORIZATION, token).body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+    let delete = Request::builder().method("DELETE").uri(format!("/api/notes/{id}"))
+        .header(header::AUTHORIZATION, "Bearer 101|owner-secret").body(Body::empty()).unwrap();
+    assert_eq!(app.oneshot(delete).await.unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_cors_preflight_and_headers() {
     let config = Config::from_env();
     let app = create_app(&config).await.expect("Failed to create app");

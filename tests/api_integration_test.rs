@@ -460,7 +460,10 @@ async fn test_large_plain_note_cursor_round_trip() {
     assert_eq!(response.status(), StatusCode::CREATED);
     let value: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let note_id = value["data"]["id"].as_u64().unwrap();
+    let created_ids: Vec<u64> = value["data"]["chunks"].as_array().unwrap().iter()
+        .map(|chunk| chunk["id"].as_u64().unwrap()).collect();
     let mut reconstructed = String::new();
+    let mut loaded_ids = Vec::new();
     let mut cursor = String::new();
     let mut pages = 0;
     loop {
@@ -470,7 +473,10 @@ async fn test_large_plain_note_cursor_round_trip() {
         assert_eq!(response.status(), StatusCode::OK);
         let page: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
         let chunks = page["chunks"].as_array().unwrap();
-        for chunk in chunks { reconstructed.push_str(chunk["content"].as_str().unwrap()); }
+        for chunk in chunks {
+            reconstructed.push_str(chunk["content"].as_str().unwrap());
+            loaded_ids.push(chunk["id"].as_u64().unwrap());
+        }
         pages += 1;
         if !page["has_more"].as_bool().unwrap() { break; }
         let last = chunks.last().unwrap();
@@ -478,6 +484,7 @@ async fn test_large_plain_note_cursor_round_trip() {
     }
     assert!(pages > 1);
     assert_eq!(reconstructed, content);
+    assert_eq!(loaded_ids, created_ids);
     let replace = Request::builder().method("PUT").uri(format!("/api/notes/{note_id}/chunks"))
         .header(header::AUTHORIZATION, token).header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::json!({"chunks": [

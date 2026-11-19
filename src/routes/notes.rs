@@ -283,46 +283,12 @@ pub async fn create_note(
 
     let note_id = insert_res.last_insert_id();
 
-    let mut created_chunks = Vec::new();
-    for ch in chunk_payloads {
-        let meta_json = ch.metadata.as_ref().map(|m| m.to_string());
-        let chunk_res = sqlx::query(
-            r#"
-            INSERT INTO note_chunks 
-                (note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at)
-            VALUES 
-                (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-            "#,
-        )
-        .bind(note_id)
-        .bind(&ch.chunk_uid)
-        .bind(ch.chunk_index)
-        .bind(&ch.chunk_type)
-        .bind(&ch.content)
-        .bind(ch.byte_size)
-        .bind(&ch.checksum)
-        .bind(meta_json)
-        .execute(&mut *tx)
+    let created_chunks = crate::db::insert_chunk_drafts(&mut tx, note_id, &chunk_payloads)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to insert chunk: {:?}", e);
+            tracing::error!("Failed to insert chunks: {:?}", e);
             ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create chunks".into())
         })?;
-
-        created_chunks.push(NoteChunk {
-            id: chunk_res.last_insert_id(),
-            note_id,
-            chunk_uid: ch.chunk_uid,
-            chunk_index: ch.chunk_index,
-            chunk_type: ch.chunk_type,
-            content: ch.content,
-            byte_size: ch.byte_size,
-            checksum: Some(ch.checksum),
-            metadata: ch.metadata,
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
-        });
-    }
 
     tx.commit().await.map_err(|e| {
         tracing::error!("Commit failed: {:?}", e);
@@ -451,7 +417,7 @@ pub async fn update_note(
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Update failed".into())
     })?;
 
-    let mut updated_chunks = Vec::new();
+    let updated_chunks;
     if content_changed {
         sqlx::query("DELETE FROM note_chunks WHERE note_id = ?")
             .bind(note_id)
@@ -460,42 +426,9 @@ pub async fn update_note(
             .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Chunk sync failed".into()))?;
 
         let drafts = split_into_chunks(&new_content);
-        for ch in drafts {
-            let meta_json = ch.metadata.as_ref().map(|m| m.to_string());
-            let chunk_res = sqlx::query(
-                r#"
-                INSERT INTO note_chunks 
-                    (note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at)
-                VALUES 
-                    (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-                "#,
-            )
-            .bind(note_id)
-            .bind(&ch.chunk_uid)
-            .bind(ch.chunk_index)
-            .bind(&ch.chunk_type)
-            .bind(&ch.content)
-            .bind(ch.byte_size)
-            .bind(&ch.checksum)
-            .bind(meta_json)
-            .execute(&mut *tx)
+        updated_chunks = crate::db::insert_chunk_drafts(&mut tx, note_id, &drafts)
             .await
             .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Chunk insert failed".into()))?;
-
-            updated_chunks.push(NoteChunk {
-                id: chunk_res.last_insert_id(),
-                note_id,
-                chunk_uid: ch.chunk_uid,
-                chunk_index: ch.chunk_index,
-                chunk_type: ch.chunk_type,
-                content: ch.content,
-                byte_size: ch.byte_size,
-                checksum: Some(ch.checksum),
-                metadata: ch.metadata,
-                created_at: Some(chrono::Utc::now()),
-                updated_at: Some(chrono::Utc::now()),
-            });
-        }
     } else {
         updated_chunks = sqlx::query_as::<_, NoteChunk>(
             "SELECT id, note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at FROM note_chunks WHERE note_id = ? ORDER BY chunk_index ASC"
@@ -503,7 +436,7 @@ pub async fn update_note(
         .bind(note_id)
         .fetch_all(&mut *tx)
         .await
-        .unwrap_or_default();
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Chunk query failed".into()))?;
     }
 
     tx.commit().await.map_err(|_| {

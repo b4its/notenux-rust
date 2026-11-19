@@ -212,43 +212,9 @@ pub async fn update_chunks(
             })?;
 
         let drafts = split_into_chunks(&content);
-        let mut new_chunks = Vec::new();
-        for ch in drafts {
-            let meta_json = ch.metadata.as_ref().map(|m| m.to_string());
-            let chunk_res = sqlx::query(
-                r#"
-                INSERT INTO note_chunks 
-                    (note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, metadata, created_at, updated_at)
-                VALUES 
-                    (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-                "#,
-            )
-            .bind(note_id)
-            .bind(&ch.chunk_uid)
-            .bind(ch.chunk_index)
-            .bind(&ch.chunk_type)
-            .bind(&ch.content)
-            .bind(ch.byte_size)
-            .bind(&ch.checksum)
-            .bind(meta_json)
-            .execute(&mut *tx)
+        let new_chunks = crate::db::insert_chunk_drafts(&mut tx, note_id, &drafts)
             .await
             .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Chunk insert failed".into()))?;
-
-            new_chunks.push(NoteChunk {
-                id: chunk_res.last_insert_id(),
-                note_id,
-                chunk_uid: ch.chunk_uid,
-                chunk_index: ch.chunk_index,
-                chunk_type: ch.chunk_type,
-                content: ch.content,
-                byte_size: ch.byte_size,
-                checksum: Some(ch.checksum),
-                metadata: ch.metadata,
-                created_at: Some(chrono::Utc::now()),
-                updated_at: Some(chrono::Utc::now()),
-            });
-        }
 
         let metrics = calculate_metrics(&content);
         sqlx::query(
@@ -306,53 +272,22 @@ pub async fn update_chunks(
                 )
             })?;
 
-        let mut inserted_chunks = Vec::new();
         let mut reassembled_text = String::new();
-
-        for (idx, ch) in chunks.into_iter().enumerate() {
-            let chunk_index = ch.chunk_index.unwrap_or(idx as u32);
-            let chunk_type = ch
-                .chunk_type
-                .unwrap_or_else(|| detect_chunk_type(&ch.content));
-            let byte_size = ch.content.len() as u32;
-            let checksum = compute_checksum(&ch.content);
-            let chunk_uid = crate::chunker::generate_chunk_uid();
-
-            reassembled_text.push_str(&ch.content);
-
-            let res = sqlx::query(
-                r#"
-                INSERT INTO note_chunks
-                    (note_id, chunk_uid, chunk_index, chunk_type, content, byte_size, checksum, created_at, updated_at)
-                VALUES
-                    (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-                "#,
-            )
-            .bind(note_id)
-            .bind(&chunk_uid)
-            .bind(chunk_index)
-            .bind(&chunk_type)
-            .bind(&ch.content)
-            .bind(byte_size)
-            .bind(&checksum)
-            .execute(&mut *tx)
+        let drafts: Vec<crate::chunker::ChunkDraft> = chunks.into_iter().enumerate().map(|(index, chunk)| {
+            reassembled_text.push_str(&chunk.content);
+            crate::chunker::ChunkDraft {
+                chunk_uid: crate::chunker::generate_chunk_uid(),
+                chunk_index: chunk.chunk_index.unwrap_or(index as u32),
+                chunk_type: chunk.chunk_type.unwrap_or_else(|| detect_chunk_type(&chunk.content)),
+                byte_size: chunk.content.len() as u32,
+                checksum: compute_checksum(&chunk.content),
+                content: chunk.content,
+                metadata: None,
+            }
+        }).collect();
+        let inserted_chunks = crate::db::insert_chunk_drafts(&mut tx, note_id, &drafts)
             .await
             .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Chunk insert failed".into()))?;
-
-            inserted_chunks.push(NoteChunk {
-                id: res.last_insert_id(),
-                note_id,
-                chunk_uid,
-                chunk_index,
-                chunk_type,
-                content: ch.content,
-                byte_size,
-                checksum: Some(checksum),
-                metadata: None,
-                created_at: Some(chrono::Utc::now()),
-                updated_at: Some(chrono::Utc::now()),
-            });
-        }
 
         let metrics = calculate_metrics(&reassembled_text);
         sqlx::query(

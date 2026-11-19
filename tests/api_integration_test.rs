@@ -69,6 +69,52 @@ async fn test_dev_header_and_malformed_tokens_cannot_bypass_authentication() {
 }
 
 #[tokio::test]
+async fn large_writes_are_bounded_without_blocking_reads() {
+    use std::{convert::Infallible, time::Duration};
+    let app = create_app(&Config::from_env()).await.unwrap();
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let (started, receiver) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            let _ = started.send(());
+            futures_util::future::pending::<Result<axum::body::Bytes, Infallible>>().await
+        }));
+        let request = Request::builder().method("POST").uri("/api/notes")
+            .header(header::AUTHORIZATION, "Bearer 1|sanctum_test_token_1234567890abcdef")
+            .header(header::CONTENT_TYPE, "application/json").body(body).unwrap();
+        tasks.push(tokio::spawn(app.clone().oneshot(request)));
+        tokio::time::timeout(Duration::from_secs(5), receiver).await.unwrap().unwrap();
+    }
+    let (started, receiver) = tokio::sync::oneshot::channel();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        let _ = started.send(());
+        futures_util::future::pending::<Result<axum::body::Bytes, Infallible>>().await
+    }));
+    let request = Request::builder().method("PUT").uri("/api/notes/1/chunks/1")
+        .header(header::AUTHORIZATION, "Bearer 1|sanctum_test_token_1234567890abcdef")
+        .header(header::CONTENT_TYPE, "application/json").body(body).unwrap();
+    tasks.push(tokio::spawn(app.clone().oneshot(request)));
+    assert!(tokio::time::timeout(Duration::from_millis(100), receiver).await.is_err());
+    let read = Request::builder().uri("/api/notes")
+        .header(header::AUTHORIZATION, "Bearer 1|sanctum_test_token_1234567890abcdef")
+        .body(Body::empty()).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), app.oneshot(read)).await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    for task in tasks { task.abort(); }
+}
+
+#[tokio::test]
+async fn oversized_note_write_is_rejected() {
+    let app = create_app(&Config::from_env()).await.unwrap();
+    let request = Request::builder().method("POST").uri("/api/notes")
+        .header(header::AUTHORIZATION, "Bearer 1|sanctum_test_token_1234567890abcdef")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(r#"{{"content":"{}"}}"#, "x".repeat(8 * 1024 * 1024))))
+        .unwrap();
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn test_invalid_sanctum_token_rejected() {
     let config = Config::from_env();
     let app = create_app(&config).await.expect("Failed to create app");
@@ -452,7 +498,7 @@ async fn test_full_specification_workflow() {
 async fn test_large_plain_note_cursor_round_trip() {
     let app = create_app(&Config::from_env()).await.expect("test database required");
     let token = "Bearer 1|sanctum_test_token_1234567890abcdef";
-    let content = format!("{}🦀\n\n{}", "a".repeat(150_000), "b".repeat(150_000));
+    let content = format!("{}🦀\n\n{}", "a".repeat(1_050_000), "b".repeat(1_050_000));
     let create = Request::builder().method("POST").uri("/api/notes")
         .header(header::AUTHORIZATION, token).header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::json!({"title":"Cursor performance fixture", "content":content}).to_string())).unwrap();
@@ -485,6 +531,14 @@ async fn test_large_plain_note_cursor_round_trip() {
     assert!(pages > 1);
     assert_eq!(reconstructed, content);
     assert_eq!(loaded_ids, created_ids);
+    let update_note = Request::builder().method("PUT").uri(format!("/api/notes/{note_id}"))
+        .header(header::AUTHORIZATION, token).header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({"content": content}).to_string())).unwrap();
+    assert_eq!(app.clone().oneshot(update_note).await.unwrap().status(), StatusCode::OK);
+    let update_all_chunks = Request::builder().method("PUT").uri(format!("/api/notes/{note_id}/chunks"))
+        .header(header::AUTHORIZATION, token).header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({"content": content}).to_string())).unwrap();
+    assert_eq!(app.clone().oneshot(update_all_chunks).await.unwrap().status(), StatusCode::OK);
     let replace = Request::builder().method("PUT").uri(format!("/api/notes/{note_id}/chunks"))
         .header(header::AUTHORIZATION, token).header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::json!({"chunks": [
